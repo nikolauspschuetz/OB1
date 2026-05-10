@@ -7,6 +7,7 @@ COPY deno.json ./
 RUN deno install
 
 COPY index.ts ./
+COPY llm/ ./llm/
 
 # Run as the unprivileged user shipped with the deno image
 USER deno

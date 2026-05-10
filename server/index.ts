@@ -31,6 +31,7 @@ import { StreamableHTTPTransport } from "@hono/mcp";
 import { type Context, Hono } from "hono";
 import { z } from "zod";
 import { Pool } from "postgres";
+import { embed as llmEmbed } from "./llm/client.ts";
 
 // --- Config ---
 
@@ -47,11 +48,15 @@ if (!MCP_ACCESS_KEY) {
 }
 const MCP_PORT = parseInt(Deno.env.get("MCP_PORT") || "8000", 10);
 
+// EMBEDDING_API_BASE / EMBEDDING_API_KEY / EMBEDDING_MODEL are read inside
+// the LLM wrapper (server/llm/client.ts:embedConfigFromEnv). They're still
+// declared in .env.example and validated by ci/check-env-drift.sh which
+// scans server/**/*.ts. Kept here as fallback defaults for CHAT_API_BASE /
+// CHAT_API_KEY below (when those are blank, the wrapper inherits the
+// embedding endpoint).
 const EMBEDDING_API_BASE = Deno.env.get("EMBEDDING_API_BASE") ||
   "https://models.github.ai/inference";
 const EMBEDDING_API_KEY = Deno.env.get("EMBEDDING_API_KEY") || "";
-const EMBEDDING_MODEL = Deno.env.get("EMBEDDING_MODEL") ||
-  "openai/text-embedding-3-small";
 
 const CHAT_PROVIDER = (Deno.env.get("CHAT_PROVIDER") || "openai").toLowerCase();
 const CHAT_API_BASE = Deno.env.get("CHAT_API_BASE") || EMBEDDING_API_BASE;
@@ -346,31 +351,14 @@ async function getEmbedding(text: string): Promise<number[]> {
       embeddingHealth.lastSuccessAt = Date.now();
       return out;
     }
-    const r = await fetch(`${EMBEDDING_API_BASE}/embeddings`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${EMBEDDING_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
-    });
-    if (!r.ok) {
-      const msg = await r.text().catch(() => "");
-      m.embeddingRequestsTotal.inc({ outcome: "error" });
-      const err = `Embedding API failed: ${r.status} ${msg.slice(0, 200)}`;
-      embeddingHealth.lastErrorAt = Date.now();
-      embeddingHealth.lastError = err;
-      throw new Error(err);
-    }
-    const d = await r.json();
+    const result = await llmEmbed({ input: text });
     m.embeddingRequestsTotal.inc({ outcome: "success" });
     embeddingHealth.lastSuccessAt = Date.now();
-    return d.data[0].embedding;
+    return result.embeddings[0];
   } catch (err) {
-    if (!embeddingHealth.lastErrorAt || embeddingHealth.lastError === null) {
-      embeddingHealth.lastErrorAt = Date.now();
-      embeddingHealth.lastError = (err as Error).message;
-    }
+    m.embeddingRequestsTotal.inc({ outcome: "error" });
+    embeddingHealth.lastErrorAt = Date.now();
+    embeddingHealth.lastError = (err as Error).message;
     throw err;
   } finally {
     m.embeddingDurationSeconds.observe((performance.now() - t0) / 1000);

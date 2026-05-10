@@ -320,11 +320,11 @@ smoke-webhook: ci-env ## End-to-end GitHub webhook test (LLM_MOCK + synthetic de
 
 fmt-check: ## Verify deno fmt has been applied (fails on drift)
 	@command -v deno >/dev/null 2>&1 || { echo "deno not found. Install: curl -fsSL https://deno.land/install.sh | sh"; exit 1; }
-	deno fmt --check server/index.ts bin/obctl
+	deno fmt --check server/ bin/obctl
 
 lint: ## Run deno lint on server and obctl
 	@command -v deno >/dev/null 2>&1 || { echo "deno not found. Install: curl -fsSL https://deno.land/install.sh | sh"; exit 1; }
-	deno lint server/index.ts bin/obctl
+	deno lint server/ bin/obctl
 
 check-env-drift: ## Verify .env.example documents every env var the server reads
 	@./ci/check-env-drift.sh

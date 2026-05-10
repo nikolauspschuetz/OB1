@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Drift detector between server/index.ts (what the server reads) and
+# Drift detector between server/**/*.ts (what the server reads) and
 # .env.example (what we document). Run by `make check-env-drift`.
 #
 # - FAIL if server reads a var that's not in .env.example (undocumented).
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SERVER="$REPO_ROOT/server/index.ts"
+SERVER_DIR="$REPO_ROOT/server"
 ENV_EXAMPLE="$REPO_ROOT/.env.example"
 
 # Vars that appear in .env.example but the server never reads (consumed by
@@ -24,17 +24,19 @@ ALLOW_UNREAD=(
   AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION AWS_PROFILE
 )
 
-if [[ ! -f "$SERVER" ]]; then
-  echo "ERROR: $SERVER not found"; exit 2
+if [[ ! -d "$SERVER_DIR" ]]; then
+  echo "ERROR: $SERVER_DIR not found"; exit 2
 fi
 if [[ ! -f "$ENV_EXAMPLE" ]]; then
   echo "ERROR: $ENV_EXAMPLE not found"; exit 2
 fi
 
-# Names the server reads via Deno.env.get("X").
+# Names the server reads via Deno.env.get("X") across every .ts file in
+# server/ (index.ts plus llm/, future modules, etc).
 SERVER_VARS=()
 while IFS= read -r v; do SERVER_VARS+=("$v"); done < <(
-  grep -oE 'Deno\.env\.get\("[A-Z][A-Z0-9_]*"\)' "$SERVER" \
+  find "$SERVER_DIR" -type f -name '*.ts' -print0 \
+  | xargs -0 grep -hoE 'Deno\.env\.get\("[A-Z][A-Z0-9_]*"\)' \
   | sed -E 's/.*"([A-Z][A-Z0-9_]*)".*/\1/' \
   | sort -u
 )
@@ -83,7 +85,7 @@ if (( ${#unread_by_server[@]} > 0 )); then
 fi
 
 if (( status == 0 )) && (( ${#unread_by_server[@]} == 0 )); then
-  echo "OK — env vars in $SERVER and $ENV_EXAMPLE are in sync."
+  echo "OK — env vars in $SERVER_DIR and $ENV_EXAMPLE are in sync."
   echo "  server reads: ${#SERVER_VARS[@]}"
   echo "  example documents: ${#ENV_VARS[@]}"
 fi
