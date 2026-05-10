@@ -1,0 +1,82 @@
+# Local-stack CI for this fork.
+# Runs the docker-compose stack with LLM_MOCK=true and exercises the smoke
+# tests on every push to main and every pull request. No real LLM credentials
+# required — the mock embedding/metadata path validates the plumbing only.
+#
+# This workflow is independent of the upstream community-contribution review
+# workflows in this directory; it gates the local-Docker stack added by this
+# fork (Makefile, docker-compose.yml, server/index.ts, db/migrations,
+# bin/obctl).
+
+name: local-stack-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'db/**'
+      - 'bin/**'
+      - 'ci/**'
+      - 'docker-compose.yml'
+      - 'Makefile'
+      - '.env.example'
+      - '.github/workflows/local-stack-ci.yml'
+  pull_request:
+    paths:
+      - 'server/**'
+      - 'db/**'
+      - 'bin/**'
+      - 'ci/**'
+      - 'docker-compose.yml'
+      - 'Makefile'
+      - '.env.example'
+      - '.github/workflows/local-stack-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: smoke + webhook + metrics
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Show tool versions
+        run: |
+          docker --version
+          docker compose version
+          deno --version
+          make --version | head -1
+          bash --version | head -1
+
+      - name: Quality gates (fmt + lint + env drift)
+        run: make quality
+
+      - name: Run make ci (quality + smoke + smoke-webhook)
+        run: make ci
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          echo "=== docker compose ps ==="
+          docker compose ps || true
+          echo
+          echo "=== mcp logs ==="
+          docker compose logs --tail=200 mcp || true
+          echo
+          echo "=== db logs ==="
+          docker compose logs --tail=200 db || true
+
+      - name: Tear down on failure
+        if: always()
+        run: docker compose down -v || true

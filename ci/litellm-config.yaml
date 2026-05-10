@@ -1,0 +1,81 @@
+# LiteLLM gateway config — translates OpenAI-compatible requests to AWS Bedrock
+# (and other providers if you add them here). Only loaded when the bedrock
+# compose profile is active.
+#
+# To USE bedrock-backed models from the MCP server, set in your .env:
+#   CHAT_PROVIDER=openai
+#   CHAT_API_BASE=http://litellm:4000
+#   CHAT_API_KEY=anything           # LiteLLM doesn't validate, but the MCP
+#                                   # server sends Authorization: Bearer …
+#   CHAT_MODEL=bedrock/claude-haiku
+#
+# For embeddings (CAVEAT: Bedrock embedding models produce different
+# dimensions than text-embedding-3-small's 1536. If you switch, you must
+# edit db/migrations/001_init.sql + 002_search_function.sql to match the
+# new dimension AND wipe the data volume since existing rows can't be
+# rewritten in place):
+#   EMBEDDING_API_BASE=http://litellm:4000
+#   EMBEDDING_API_KEY=anything
+#   EMBEDDING_MODEL=bedrock/cohere-embed-english   # 1024-dim
+#
+# Recommended hybrid: keep embeddings on GitHub Models (1536, no schema
+# change) and only route chat through Bedrock.
+
+model_list:
+  # ----- Chat -----
+
+  # Claude 4.x on Bedrock requires the cross-region inference profile (`us.`
+  # prefix), not the raw model ID. Without this, on-demand calls return:
+  #   "Invocation of model ID … with on-demand throughput isn’t supported.
+  #    Retry your request with the ID or ARN of an inference profile…"
+  # AWS also auto-flags models you haven't called in 30 days as "Legacy" and
+  # blocks new on-demand calls until you upgrade. Keep these aliases pointed
+  # at currently-active versions; bump when you see a "Legacy" 404 from
+  # `make verify-bedrock`. List active models:
+  #   aws bedrock list-foundation-models --by-provider anthropic \
+  #       --by-output-modality TEXT \
+  #       --query 'modelSummaries[?modelLifecycle.status==`ACTIVE`]'
+  - model_name: bedrock/claude-haiku
+    litellm_params:
+      model: bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0
+      aws_region_name: os.environ/AWS_REGION
+
+  - model_name: bedrock/claude-sonnet
+    litellm_params:
+      model: bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
+      aws_region_name: os.environ/AWS_REGION
+
+  - model_name: bedrock/claude-opus
+    litellm_params:
+      model: bedrock/us.anthropic.claude-opus-4-7
+      aws_region_name: os.environ/AWS_REGION
+
+  # ----- Embeddings (1024-dim — schema change required if you route here) -----
+
+  - model_name: bedrock/cohere-embed-english
+    litellm_params:
+      model: bedrock/cohere.embed-english-v3
+      aws_region_name: os.environ/AWS_REGION
+
+  - model_name: bedrock/titan-embed-v2
+    litellm_params:
+      model: bedrock/amazon.titan-embed-text-v2:0
+      aws_region_name: os.environ/AWS_REGION
+
+# ----- Mock routes (used by `make smoke-bedrock`, no AWS creds) -----
+
+  - model_name: mock/chat
+    litellm_params:
+      model: openai/mock-chat
+      api_base: os.environ/MOCK_OPENAI_URL
+      api_key: mock-key
+
+  - model_name: mock/embedding
+    litellm_params:
+      model: openai/mock-embedding
+      api_base: os.environ/MOCK_OPENAI_URL
+      api_key: mock-key
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false

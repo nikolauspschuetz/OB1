@@ -1,0 +1,122 @@
+# Open Brain — local Docker Compose stack.
+# Boots Postgres + pgvector and the MCP server. Reads config from .env (or
+# .env.<profile> when invoked via `make up PROFILE=foo`).
+#
+# All containers and the data volume are named by Docker Compose's project
+# (default `ob1`, or `ob1-<profile>` via `docker compose -p`), so multiple
+# stacks can run side-by-side without name collisions.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-openbrain}
+      POSTGRES_USER: ${DB_USER:-openbrain}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+    ports:
+      - "${DB_PORT:-55432}:5432"
+    volumes:
+      - ob1-db-data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-openbrain} -d ${DB_NAME:-openbrain}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mcp:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-openbrain}
+      DB_USER: ${DB_USER:-openbrain}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      MCP_ACCESS_KEY: ${MCP_ACCESS_KEY:?MCP_ACCESS_KEY must be set in .env}
+      MCP_PORT: 8000
+      LLM_MOCK: ${LLM_MOCK:-false}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      LINEAR_WEBHOOK_SECRET: ${LINEAR_WEBHOOK_SECRET:-}
+      SENTRY_WEBHOOK_SECRET: ${SENTRY_WEBHOOK_SECRET:-}
+      GENERIC_WEBHOOK_SECRET: ${GENERIC_WEBHOOK_SECRET:-}
+      GENERIC_WEBHOOK_CONTENT_PATH: ${GENERIC_WEBHOOK_CONTENT_PATH:-}
+      GENERIC_WEBHOOK_METADATA_PATH: ${GENERIC_WEBHOOK_METADATA_PATH:-}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      EMBEDDING_STALE_SECONDS: ${EMBEDDING_STALE_SECONDS:-0}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-https://models.github.ai/inference}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-openai/text-embedding-3-small}
+      CHAT_PROVIDER: ${CHAT_PROVIDER:-openai}
+      CHAT_API_BASE: ${CHAT_API_BASE:-}
+      CHAT_API_KEY: ${CHAT_API_KEY:-}
+      CHAT_MODEL: ${CHAT_MODEL:-openai/gpt-4o-mini}
+      ANTHROPIC_API_BASE: ${ANTHROPIC_API_BASE:-https://api.anthropic.com}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_CHAT_MODEL: ${ANTHROPIC_CHAT_MODEL:-claude-haiku-4-5-20251001}
+      ANTHROPIC_VERSION: ${ANTHROPIC_VERSION:-2023-06-01}
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "deno eval \"const r = await fetch('http://127.0.0.1:8000/healthz'); Deno.exit(r.ok ? 0 : 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # LiteLLM gateway — runs under the `bedrock` profile (real AWS) or
+  # `ci-bedrock` profile (mock-openai upstream, no AWS creds needed).
+  # Bring up with: BACKEND=bedrock make up
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    profiles: ["bedrock", "ci-bedrock"]
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
+    volumes:
+      - ./ci/litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      LITELLM_LOG: ${LITELLM_LOG:-INFO}
+      MOCK_OPENAI_URL: ${MOCK_OPENAI_URL:-http://mock-openai:4001}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/health/liveliness >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # Mock OpenAI-compatible upstream for `make smoke-bedrock`. Only runs
+  # under the `ci-bedrock` profile. Lets us validate the LiteLLM wiring
+  # without real AWS credentials.
+  mock-openai:
+    image: denoland/deno:2.3.3
+    profiles: ["ci-bedrock"]
+    restart: unless-stopped
+    command: ["run", "--allow-net", "--allow-env", "/app/mock-openai.ts"]
+    volumes:
+      - ./ci/mock-openai.ts:/app/mock-openai.ts:ro
+    environment:
+      PORT: "4001"
+    ports:
+      - "${MOCK_OPENAI_PORT:-4001}:4001"
+    healthcheck:
+      test: ["CMD-SHELL", "deno eval \"const r = await fetch('http://127.0.0.1:4001/healthz'); Deno.exit(r.ok ? 0 : 1)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  ob1-db-data: {}

@@ -1,0 +1,551 @@
+#!/usr/bin/env -S deno run --allow-net --allow-env --allow-read
+/**
+ * obctl — terminal client for a running Open Brain MCP server.
+ *
+ * Subcommands:
+ *   obctl capture <text>       Capture a thought
+ *   obctl capture --stdin      Capture text from stdin
+ *   obctl search <query>       Semantic search
+ *   obctl list [--limit N]     List recent thoughts
+ *                              [--type T] [--topic X] [--person P] [--days N]
+ *   obctl tail                 Stream new captures as they land
+ *                              [--interval N] [--type T] [--topic X] [--source S]
+ *                              [--webhooks]  shorthand for all webhook sources
+ *   obctl stats                Aggregate stats
+ *   obctl bookmark <id>        Set metadata.bookmarked=true (use --remove to unset)
+ *   obctl unbookmark <id>      Set metadata.bookmarked=false (alias for bookmark --remove)
+ *   obctl tag <id> --add X     Add topic X to metadata.topics
+ *   obctl tag <id> --remove X  Remove topic X from metadata.topics
+ *   obctl forget <id> [--yes]  Permanently delete a thought (prompts unless --yes)
+ *   obctl health               GET /healthz
+ *
+ * Connection:
+ *   OB1_PROFILE  selects which env file to read for defaults.
+ *                Resolution order:
+ *                  1. --profile flag
+ *                  2. OB1_PROFILE env var
+ *                  3. .ob1-profile file walking up from cwd
+ *                  4. git remote origin → ~/github.com/<org>/.ob1-profile
+ *                  5. (none) → ./.env
+ *   OB1_URL      default http://localhost:${MCP_PORT or 8000}
+ *   OB1_KEY      default read from the resolved env file (MCP_ACCESS_KEY)
+ *   Override per-call with --profile, --url, --key.
+ *
+ *   --json   Print raw JSON-RPC result instead of formatted text.
+ */
+
+const args = Deno.args.slice();
+const flags: Record<string, string | boolean> = {};
+const positional: string[] = [];
+
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a.startsWith("--")) {
+    const eq = a.indexOf("=");
+    if (eq > 0) {
+      flags[a.slice(2, eq)] = a.slice(eq + 1);
+    } else if (i + 1 < args.length && !args[i + 1].startsWith("--")) {
+      flags[a.slice(2)] = args[++i];
+    } else {
+      flags[a.slice(2)] = true;
+    }
+  } else {
+    positional.push(a);
+  }
+}
+
+const cmd = positional.shift();
+
+function readEnvFile(path: string): Record<string, string> {
+  try {
+    const content = Deno.readTextFileSync(path);
+    const env: Record<string, string> = {};
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq < 0) continue;
+      const key = trimmed.slice(0, eq).trim();
+      let val = trimmed.slice(eq + 1);
+      if (!val.startsWith('"') && !val.startsWith("'")) {
+        const hash = val.indexOf("#");
+        if (hash >= 0) val = val.slice(0, hash);
+      }
+      val = val.trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      env[key] = val;
+    }
+    return env;
+  } catch {
+    return {};
+  }
+}
+
+async function readProfileMarker(path: string): Promise<string> {
+  try {
+    const content = await Deno.readTextFile(path);
+    return content.trim();
+  } catch {
+    return "";
+  }
+}
+
+async function resolveProfileFromCwd(): Promise<{ name: string; from: string }> {
+  // Walk up from cwd looking for a .ob1-profile file (mirrors gh.sh's
+  // .gh-user lookup). Returns the first one found.
+  let dir = Deno.cwd();
+  while (true) {
+    const name = await readProfileMarker(`${dir}/.ob1-profile`);
+    if (name) return { name, from: `${dir}/.ob1-profile` };
+    const parent = dir.replace(/\/[^/]+$/, "") || "/";
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Fallback: read git remote, map to ~/github.com/<org>/.ob1-profile.
+  // Handles worktrees where the marker isn't on the cwd path.
+  try {
+    const cmd = new Deno.Command("git", {
+      args: ["remote", "get-url", "origin"],
+      stdout: "piped",
+      stderr: "null",
+    });
+    const { code, stdout } = await cmd.output();
+    if (code === 0) {
+      const url = new TextDecoder().decode(stdout).trim();
+      const match = url.match(/[:/]([^/]+)\/[^/]+?(?:\.git)?$/);
+      if (match) {
+        const org = match[1];
+        const home = Deno.env.get("HOME") || "";
+        const path = `${home}/github.com/${org}/.ob1-profile`;
+        const name = await readProfileMarker(path);
+        if (name) return { name, from: path };
+      }
+    }
+  } catch {
+    // git not available or not a repo
+  }
+  return { name: "", from: "" };
+}
+
+let PROFILE = String(flags.profile ?? Deno.env.get("OB1_PROFILE") ?? "");
+let profileSource = "";
+if (!PROFILE) {
+  const detected = await resolveProfileFromCwd();
+  if (detected.name) {
+    PROFILE = detected.name;
+    profileSource = detected.from;
+    console.error(
+      `# auto-detected profile: ${PROFILE} (from ${detected.from})`,
+    );
+  }
+}
+const ENV_FILE = PROFILE ? `.env.${PROFILE}` : ".env";
+const dotenv = readEnvFile(ENV_FILE);
+const KEY = String(
+  flags.key ?? Deno.env.get("OB1_KEY") ?? dotenv.MCP_ACCESS_KEY ?? "",
+);
+const PORT = String(
+  flags.port ?? Deno.env.get("MCP_PORT") ?? dotenv.MCP_PORT ?? "8000",
+);
+const URL_BASE = String(
+  flags.url ?? Deno.env.get("OB1_URL") ?? `http://localhost:${PORT}`,
+);
+const JSON_OUT = Boolean(flags.json);
+
+if (!cmd || cmd === "help" || flags.help) {
+  console.log(`obctl — Open Brain CLI
+
+Usage:
+  obctl capture <text>          Capture a thought
+  obctl capture --stdin         Read text from stdin
+  obctl search <query>          Semantic search
+  obctl list [--limit N] [--type T] [--topic X] [--person P] [--days N]
+  obctl tail [--interval N] [--type T] [--topic X] [--source S] [--webhooks]
+                                Stream new captures as they land (Ctrl+C to stop).
+                                --webhooks = source filter for all webhook captures.
+  obctl stats                   Aggregate stats
+  obctl bookmark <id> [--remove]
+                                Set/unset metadata.bookmarked
+  obctl unbookmark <id>         Alias for: bookmark <id> --remove
+  obctl tag <id> [--add X] [--remove X]
+                                Add or remove topic X from metadata.topics
+  obctl forget <id> [--yes]     Permanently delete a thought (prompts unless --yes)
+  obctl health                  Health check
+  obctl help                    This message
+
+Environment:
+  OB1_PROFILE  selects env file. Resolution:
+                 1. --profile flag
+                 2. OB1_PROFILE env
+                 3. .ob1-profile file in cwd or any ancestor
+                 4. git remote → ~/github.com/<org>/.ob1-profile
+                 5. (none) → ./.env
+  OB1_URL      (default ${URL_BASE})
+  OB1_KEY      (default: read MCP_ACCESS_KEY from ${ENV_FILE})${
+  profileSource ? `\n               (profile auto-detected from ${profileSource})` : ""
+}
+
+Flags:
+  --profile=P  Use .env.<P> instead of .env (overrides cwd auto-detection)
+  --url=URL    Override OB1_URL
+  --key=KEY    Override OB1_KEY
+  --json       Print raw JSON-RPC result
+`);
+  Deno.exit(cmd ? 0 : 1);
+}
+
+if (cmd === "health") {
+  try {
+    const r = await fetch(`${URL_BASE}/healthz`);
+    const body = await r.text();
+    if (JSON_OUT) {
+      console.log(body);
+    } else {
+      console.log(`${r.status} ${r.ok ? "OK" : "FAIL"} — ${body}`);
+    }
+    Deno.exit(r.ok ? 0 : 1);
+  } catch (err) {
+    console.error(`Cannot reach ${URL_BASE}: ${(err as Error).message}`);
+    Deno.exit(2);
+  }
+}
+
+if (!KEY) {
+  console.error(
+    "No access key. Set OB1_KEY, --key=..., or ensure ./.env has MCP_ACCESS_KEY.",
+  );
+  Deno.exit(2);
+}
+
+function parseRpcBody(contentType: string, body: string): unknown {
+  if (contentType.includes("text/event-stream")) {
+    // Take the data: lines from the first event.
+    const lines = body.split(/\r?\n/);
+    const data: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("data: ")) data.push(line.slice(6));
+      else if (line.startsWith("data:")) data.push(line.slice(5));
+      else if (line === "" && data.length) break;
+    }
+    if (data.length) return JSON.parse(data.join("\n"));
+  }
+  return JSON.parse(body);
+}
+
+async function rpc(
+  method: string,
+  params: Record<string, unknown>,
+): Promise<unknown> {
+  const r = await fetch(`${URL_BASE}?key=${encodeURIComponent(KEY)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  const body = await r.text();
+  if (!r.ok) {
+    throw new Error(`HTTP ${r.status}: ${body.slice(0, 200)}`);
+  }
+  const ct = r.headers.get("content-type") || "";
+  const parsed = parseRpcBody(ct, body) as {
+    error?: { message: string };
+    result?: unknown;
+  };
+  if (parsed.error) {
+    throw new Error(`RPC error: ${parsed.error.message}`);
+  }
+  return parsed.result;
+}
+
+async function callTool(
+  name: string,
+  args: Record<string, unknown>,
+): Promise<{ content: Array<{ type: string; text?: string }> }> {
+  const result = await rpc("tools/call", { name, arguments: args }) as {
+    content: Array<{ type: string; text?: string }>;
+  };
+  return result;
+}
+
+function printToolResult(
+  result: { content: Array<{ type: string; text?: string }> },
+) {
+  if (JSON_OUT) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  for (const c of result.content || []) {
+    if (c.type === "text" && typeof c.text === "string") console.log(c.text);
+  }
+}
+
+async function readStdin(): Promise<string> {
+  const decoder = new TextDecoder();
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of Deno.stdin.readable) chunks.push(chunk);
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.length;
+  }
+  return decoder.decode(merged).trim();
+}
+
+try {
+  switch (cmd) {
+    case "capture": {
+      const content = flags.stdin
+        ? await readStdin()
+        : positional.join(" ").trim();
+      if (!content) {
+        console.error(
+          "Provide text: obctl capture \"...\"  or  echo ... | obctl capture --stdin",
+        );
+        Deno.exit(2);
+      }
+      printToolResult(await callTool("capture_thought", { content }));
+      break;
+    }
+    case "search": {
+      const query = positional.join(" ").trim();
+      if (!query) {
+        console.error("Provide a query: obctl search \"...\"");
+        Deno.exit(2);
+      }
+      const params: Record<string, unknown> = { query };
+      if (flags.limit) params.limit = Number(flags.limit);
+      if (flags.threshold) params.threshold = Number(flags.threshold);
+      printToolResult(await callTool("search_thoughts", params));
+      break;
+    }
+    case "list": {
+      const params: Record<string, unknown> = {};
+      if (flags.limit) params.limit = Number(flags.limit);
+      if (flags.type) params.type = String(flags.type);
+      if (flags.topic) params.topic = String(flags.topic);
+      if (flags.person) params.person = String(flags.person);
+      if (flags.days) params.days = Number(flags.days);
+      printToolResult(await callTool("list_thoughts", params));
+      break;
+    }
+    case "stats": {
+      printToolResult(await callTool("thought_stats", {}));
+      break;
+    }
+    case "forget": {
+      const id = positional[0];
+      if (!id) {
+        console.error("Provide a thought id: obctl forget <id>");
+        Deno.exit(2);
+      }
+      if (!flags.yes) {
+        await Deno.stderr.write(
+          new TextEncoder().encode(
+            `Permanently delete thought ${id}? This cannot be undone. [y/N] `,
+          ),
+        );
+        const buf = new Uint8Array(8);
+        const n = await Deno.stdin.read(buf);
+        const ans = n ? new TextDecoder().decode(buf.subarray(0, n)).trim() : "";
+        if (ans !== "y") {
+          console.error("Aborted.");
+          Deno.exit(1);
+        }
+      }
+      const r = await fetch(
+        `${URL_BASE}/thoughts/${encodeURIComponent(id)}?key=${
+          encodeURIComponent(KEY)
+        }`,
+        { method: "DELETE" },
+      );
+      const body = await r.text();
+      if (!r.ok) {
+        console.error(`Error: HTTP ${r.status}: ${body.slice(0, 200)}`);
+        Deno.exit(1);
+      }
+      if (JSON_OUT) {
+        console.log(body);
+      } else {
+        console.log(`${id} deleted`);
+      }
+      break;
+    }
+    case "unbookmark":
+    case "bookmark": {
+      const id = positional[0];
+      if (!id) {
+        console.error("Provide a thought id: obctl bookmark <id>");
+        Deno.exit(2);
+      }
+      const remove = cmd === "unbookmark" || Boolean(flags.remove);
+      const merge: Record<string, unknown> = remove
+        ? { bookmarked: false }
+        : { bookmarked: true, bookmarked_at: new Date().toISOString() };
+      const r = await fetch(
+        `${URL_BASE}/thoughts/${encodeURIComponent(id)}/metadata?key=${
+          encodeURIComponent(KEY)
+        }`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ merge }),
+        },
+      );
+      const body = await r.text();
+      if (!r.ok) {
+        console.error(`Error: HTTP ${r.status}: ${body.slice(0, 200)}`);
+        Deno.exit(1);
+      }
+      if (JSON_OUT) {
+        console.log(body);
+      } else {
+        console.log(`${id} ${remove ? "unbookmarked" : "bookmarked"}`);
+      }
+      break;
+    }
+    case "tag": {
+      const id = positional[0];
+      if (!id) {
+        console.error("Provide a thought id: obctl tag <id> --add foo");
+        Deno.exit(2);
+      }
+      const add = flags.add ? [String(flags.add)] : [];
+      const remove = flags.remove ? [String(flags.remove)] : [];
+      if (!add.length && !remove.length) {
+        console.error("Provide at least one --add X or --remove X");
+        Deno.exit(2);
+      }
+      const r = await fetch(
+        `${URL_BASE}/thoughts/${encodeURIComponent(id)}/metadata?key=${
+          encodeURIComponent(KEY)
+        }`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topics_add: add, topics_remove: remove }),
+        },
+      );
+      const body = await r.text();
+      if (!r.ok) {
+        console.error(`Error: HTTP ${r.status}: ${body.slice(0, 200)}`);
+        Deno.exit(1);
+      }
+      if (JSON_OUT) {
+        console.log(body);
+      } else {
+        const result = JSON.parse(body) as {
+          metadata: { topics?: string[] };
+        };
+        const topics = result.metadata?.topics ?? [];
+        console.log(
+          `${id} topics: ${topics.length ? topics.join(", ") : "(none)"}`,
+        );
+      }
+      break;
+    }
+    case "tail": {
+      const intervalMs = Math.max(
+        Number(flags.interval ?? 2),
+        0.5,
+      ) * 1000;
+      const filterParams = new URLSearchParams();
+      if (flags.type) filterParams.set("type", String(flags.type));
+      if (flags.topic) filterParams.set("topic", String(flags.topic));
+      let sourceFilter = flags.source ? String(flags.source) : "";
+      if (flags.webhooks) {
+        const all = "github_webhook,linear_webhook,sentry_webhook,generic_webhook";
+        sourceFilter = sourceFilter ? `${sourceFilter},${all}` : all;
+      }
+      if (sourceFilter) filterParams.set("source", sourceFilter);
+      filterParams.set("key", KEY);
+
+      const tailUrl = (since?: string) => {
+        const p = new URLSearchParams(filterParams);
+        if (since) p.set("since", since);
+        return `${URL_BASE}/tail?${p.toString()}`;
+      };
+
+      type Row = {
+        id: string;
+        created_at: string;
+        content: string;
+        metadata: Record<string, unknown>;
+      };
+
+      const printRow = (r: Row) => {
+        if (JSON_OUT) {
+          console.log(JSON.stringify(r));
+          return;
+        }
+        const m = r.metadata || {};
+        const ts = new Date(r.created_at).toLocaleString();
+        const tags = Array.isArray(m.topics)
+          ? (m.topics as string[]).join(", ")
+          : "";
+        const src = m.source ? ` [${m.source}]` : "";
+        console.log(
+          `[${ts}] (${m.type || "??"}${tags ? " - " + tags : ""})${src}`,
+        );
+        for (const line of r.content.split("\n")) console.log(`  ${line}`);
+      };
+
+      const fetchSince = async (since?: string): Promise<Row[]> => {
+        const r = await fetch(tailUrl(since));
+        if (!r.ok) {
+          throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+        }
+        return await r.json() as Row[];
+      };
+
+      console.error(`# tailing ${URL_BASE} (Ctrl+C to stop)`);
+
+      // Seed: fetch the most recent batch and remember every id so we can
+      // skip them on the first poll. Postgres timestamptz has microsecond
+      // precision but JS Date / JSON ISO strings round to milliseconds, so
+      // a strict `>` comparison on a since-timestamp can re-emit the same
+      // row repeatedly. ID dedup is the simple, correct fix.
+      const seenIds = new Set<string>();
+      const seed = await fetchSince();
+      let lastSeen = seed.length
+        ? seed[seed.length - 1].created_at
+        : new Date().toISOString();
+      for (const row of seed) seenIds.add(row.id);
+
+      Deno.addSignalListener("SIGINT", () => {
+        console.error("\n# stopped");
+        Deno.exit(0);
+      });
+
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        try {
+          const rows = await fetchSince(lastSeen);
+          for (const row of rows) {
+            if (seenIds.has(row.id)) continue;
+            seenIds.add(row.id);
+            printRow(row);
+            if (row.created_at > lastSeen) lastSeen = row.created_at;
+          }
+        } catch (err) {
+          console.error(`# tail error: ${(err as Error).message}`);
+        }
+      }
+    }
+    default:
+      console.error(`Unknown command: ${cmd}. Run 'obctl help' for usage.`);
+      Deno.exit(2);
+  }
+} catch (err) {
+  console.error(`Error: ${(err as Error).message}`);
+  Deno.exit(1);
+}

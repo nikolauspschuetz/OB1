@@ -4,6 +4,10 @@
 
 <h1 align="center">Open Brain</h1>
 
+<p align="center">
+  <a href="https://github.com/NateBJones-Projects/OB1/actions/workflows/local-stack-ci.yml"><img src="https://github.com/NateBJones-Projects/OB1/actions/workflows/local-stack-ci.yml/badge.svg" alt="local-stack-ci"></a>
+</p>
+
 The infrastructure layer for your thinking. One database, one AI gateway, one chat channel. Any AI you use can plug in. No middleware, no SaaS chains, no Zapier.
 
 This isn't a notes app. It's a database with vector search and an open protocol — built so that every AI tool you use shares the same persistent memory of you. Claude, ChatGPT, Cursor, Claude Code, whatever ships next month. One brain. All of them.
@@ -14,14 +18,34 @@ https://github.com/user-attachments/assets/80a79b09-f323-42c6-b11b-de10bb6fa36f
 
 ## Getting Started
 
-https://github.com/user-attachments/assets/85208d73-112b-4204-82fd-d03b6c397a8b
+> **This fork runs Open Brain entirely on local Docker Compose.** No Supabase Cloud, no OpenRouter required. The only outbound call is to your chosen LLM provider (GitHub Models, Anthropic, OpenRouter, or Ollama for full air-gap).
 
-Never built an Open Brain? Start here:
+```bash
+cp .env.example .env       # set DB_PASSWORD and EMBEDDING_API_KEY
+make setup                 # boots Postgres+pgvector + the MCP server, verifies it works
+make urls                  # prints the MCP URL for your AI client
+```
 
-1. **[Setup Guide](docs/01-getting-started.md)** — Build the full system (database, AI gateway, Slack capture, MCP server) in about 45 minutes. No coding experience needed. Or watch the [video walkthrough](https://vimeo.com/1174979042/f883f6489a) (~27 min).
-2. **[AI-Assisted Setup](docs/04-ai-assisted-setup.md)** — Prefer building with Cursor, Claude Code, or another AI coding tool? Point it at this repo and go. Same system, different workflow.
-3. **[Companion Prompts](docs/02-companion-prompts.md)** — Five prompts that help you migrate your memories, discover use cases, and build the capture habit.
-4. **Then pick Extension 1** and start building.
+Want to verify the stack works **before** signing up for any LLM provider?
+
+```bash
+make smoke                 # boots with LLM_MOCK=true, runs full capture → search → stats
+```
+
+Includes:
+
+- **`bin/obctl`** — terminal client for capture/search/list/stats from scripts, cron jobs, or git hooks.
+- **`/webhook/github`** — HMAC-verified ingestion of merged PRs and published releases as searchable thoughts.
+
+Full walkthrough: **[docs/01-getting-started.md](docs/01-getting-started.md)** (~5 minutes).
+
+Then:
+
+1. **[AI-Assisted Setup](docs/04-ai-assisted-setup.md)** — Prefer building with Cursor, Claude Code, or another AI coding tool? Point it at this repo and go.
+2. **[Companion Prompts](docs/02-companion-prompts.md)** — Five prompts that help you migrate your memories, discover use cases, and build the capture habit.
+3. **Then pick Extension 1** and start building.
+
+> **Want the original Supabase Cloud + OpenRouter setup?** It's preserved at [`docs/legacy/01-getting-started-supabase.md`](docs/legacy/01-getting-started-supabase.md) for one release.
 
 **If you hit a wall:** We built a [FAQ](docs/03-faq.md) that covers the most common questions and gotchas. And if you need real-time help, we created dedicated AI assistants that know this system inside and out: a [Claude Skill](https://www.notion.so/product-templates/Open-Brain-Companion-Claude-Skill-31a5a2ccb526802797caeb37df3ba3cb?source=copy_link), a [ChatGPT Custom GPT](https://chatgpt.com/g/g-69a892b6a7708191b00e48ff655d5597-nate-jones-open-brain-assistant), and a [Gemini GEM](https://gemini.google.com/gem/1fDsAENjhdku-3RufY7ystbS1Md8MtDCg?usp=sharing). Use whichever one matches the AI tool you already use.
 
