@@ -1,9 +1,12 @@
 // Provider-agnostic dispatcher. Public API: chat(), embed(),
 // chatConfigFromEnv(), embedConfigFromEnv(), stripThinkBlocks().
 //
-// MVP slice (this file): only the openai provider is wired. Anthropic and
-// Ollama land in the next slice. Calling chat() with tag in {anthropic,
-// ollama} throws "not yet implemented" until then.
+// All four provider tags are wired:
+//   openai / bedrock → providers/openai.ts (LiteLLM proxy handles Bedrock)
+//   anthropic        → providers/anthropic.ts
+//   ollama (native)  → providers/ollama.ts (uses /api/generate)
+// Embeddings always go through providers/openai.ts (Anthropic has no
+// embedding endpoint; Bedrock embeddings flow through LiteLLM).
 
 import type {
   ChatRequest,
@@ -14,6 +17,8 @@ import type {
   ProviderTag,
 } from "./types.ts";
 import { openaiChat, openaiEmbed } from "./providers/openai.ts";
+import { anthropicChat } from "./providers/anthropic.ts";
+import { ollamaChat } from "./providers/ollama.ts";
 
 export { stripThinkBlocks } from "./strip.ts";
 export type {
@@ -114,9 +119,13 @@ export async function chat(
       if (cfg.tag === "openai" || cfg.tag === "bedrock") {
         return await openaiChat(adjusted, cfg);
       }
-      throw new Error(
-        `Provider ${cfg.tag} not yet implemented in this slice`,
-      );
+      if (cfg.tag === "anthropic") {
+        return await anthropicChat(adjusted, cfg);
+      }
+      if (cfg.tag === "ollama") {
+        return await ollamaChat(adjusted, cfg);
+      }
+      throw new Error(`Unknown provider tag: ${cfg.tag}`);
     } catch (err) {
       lastErr = err as Error;
       if (attempt < retries) {

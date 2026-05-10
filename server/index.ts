@@ -31,7 +31,7 @@ import { StreamableHTTPTransport } from "@hono/mcp";
 import { type Context, Hono } from "hono";
 import { z } from "zod";
 import { Pool } from "postgres";
-import { embed as llmEmbed } from "./llm/client.ts";
+import { chat as llmChat, embed as llmEmbed } from "./llm/client.ts";
 
 // --- Config ---
 
@@ -48,27 +48,16 @@ if (!MCP_ACCESS_KEY) {
 }
 const MCP_PORT = parseInt(Deno.env.get("MCP_PORT") || "8000", 10);
 
-// EMBEDDING_API_BASE / EMBEDDING_API_KEY / EMBEDDING_MODEL are read inside
-// the LLM wrapper (server/llm/client.ts:embedConfigFromEnv). They're still
-// declared in .env.example and validated by ci/check-env-drift.sh which
-// scans server/**/*.ts. Kept here as fallback defaults for CHAT_API_BASE /
-// CHAT_API_KEY below (when those are blank, the wrapper inherits the
-// embedding endpoint).
-const EMBEDDING_API_BASE = Deno.env.get("EMBEDDING_API_BASE") ||
-  "https://models.github.ai/inference";
-const EMBEDDING_API_KEY = Deno.env.get("EMBEDDING_API_KEY") || "";
-
+// All chat / embedding / Anthropic env vars (EMBEDDING_API_BASE,
+// EMBEDDING_API_KEY, EMBEDDING_MODEL, CHAT_API_BASE, CHAT_API_KEY,
+// CHAT_MODEL, ANTHROPIC_API_BASE, ANTHROPIC_API_KEY, ANTHROPIC_CHAT_MODEL,
+// ANTHROPIC_VERSION) are read inside the LLM wrapper at
+// server/llm/client.ts. They're documented in .env.example and validated
+// by ci/check-env-drift.sh which scans server/**/*.ts.
+//
+// CHAT_PROVIDER is still consulted here for metric labeling on chat-call
+// errors before the wrapper has identified which provider it dispatched to.
 const CHAT_PROVIDER = (Deno.env.get("CHAT_PROVIDER") || "openai").toLowerCase();
-const CHAT_API_BASE = Deno.env.get("CHAT_API_BASE") || EMBEDDING_API_BASE;
-const CHAT_API_KEY = Deno.env.get("CHAT_API_KEY") || EMBEDDING_API_KEY;
-const CHAT_MODEL = Deno.env.get("CHAT_MODEL") || "openai/gpt-4o-mini";
-
-const ANTHROPIC_API_BASE = Deno.env.get("ANTHROPIC_API_BASE") ||
-  "https://api.anthropic.com";
-const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY") || "";
-const ANTHROPIC_CHAT_MODEL = Deno.env.get("ANTHROPIC_CHAT_MODEL") ||
-  "claude-haiku-4-5-20251001";
-const ANTHROPIC_VERSION = Deno.env.get("ANTHROPIC_VERSION") || "2023-06-01";
 
 // LLM_MOCK=true short-circuits all outbound LLM calls so the stack boots
 // and serves traffic without any provider credentials. Embeddings are
@@ -365,65 +354,6 @@ async function getEmbedding(text: string): Promise<number[]> {
   }
 }
 
-async function extractMetadataOpenAI(
-  text: string,
-): Promise<Record<string, unknown>> {
-  const r = await fetch(`${CHAT_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${CHAT_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: CHAT_MODEL,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: METADATA_SYSTEM_PROMPT },
-        { role: "user", content: text },
-      ],
-    }),
-  });
-  if (!r.ok) return { ...METADATA_FALLBACK };
-  const d = await r.json();
-  try {
-    return JSON.parse(d.choices[0].message.content);
-  } catch {
-    return { ...METADATA_FALLBACK };
-  }
-}
-
-async function extractMetadataAnthropic(
-  text: string,
-): Promise<Record<string, unknown>> {
-  // Claude has no native JSON mode; we prefill the assistant turn with `{`
-  // to force JSON output and prepend it to the response before parsing.
-  const r = await fetch(`${ANTHROPIC_API_BASE}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": ANTHROPIC_VERSION,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: ANTHROPIC_CHAT_MODEL,
-      max_tokens: 1024,
-      system: METADATA_SYSTEM_PROMPT,
-      messages: [
-        { role: "user", content: text },
-        { role: "assistant", content: "{" },
-      ],
-    }),
-  });
-  if (!r.ok) return { ...METADATA_FALLBACK };
-  const d = await r.json();
-  const body = d?.content?.[0]?.text ?? "";
-  try {
-    return JSON.parse("{" + body);
-  } catch {
-    return { ...METADATA_FALLBACK };
-  }
-}
-
 async function extractMetadata(
   text: string,
 ): Promise<Record<string, unknown>> {
@@ -439,16 +369,31 @@ async function extractMetadata(
         dates_mentioned: [],
       };
     }
-    const provider = CHAT_PROVIDER === "anthropic" ? "anthropic" : "openai";
     try {
-      const out = await (provider === "anthropic"
-        ? extractMetadataAnthropic(text)
-        : extractMetadataOpenAI(text));
-      m.chatRequestsTotal.inc({ provider, outcome: "success" });
-      return out;
+      const result = await llmChat({
+        system: METADATA_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: text }],
+        json: true,
+        maxTokens: 1024,
+      });
+      m.chatRequestsTotal.inc({
+        provider: result.provider,
+        outcome: "success",
+      });
+      try {
+        return JSON.parse(result.text);
+      } catch {
+        return { ...METADATA_FALLBACK };
+      }
     } catch (err) {
-      m.chatRequestsTotal.inc({ provider, outcome: "error" });
-      throw err;
+      m.chatRequestsTotal.inc({
+        provider: CHAT_PROVIDER === "anthropic" ? "anthropic" : "openai",
+        outcome: "error",
+      });
+      // Match prior behavior: chat call errors fall back rather than
+      // propagate, so capture pipeline still proceeds with stub metadata.
+      void err;
+      return { ...METADATA_FALLBACK };
     }
   } finally {
     m.chatDurationSeconds.observe((performance.now() - t0) / 1000);
