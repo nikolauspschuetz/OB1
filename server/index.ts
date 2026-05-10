@@ -28,7 +28,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { z } from "zod";
 import { Pool } from "postgres";
 
@@ -112,7 +112,7 @@ const pool = new Pool({
   database: DB_NAME,
   user: DB_USER,
   password: DB_PASSWORD,
-}, 10);
+}, 20);
 
 // --- Prometheus metrics (text exposition format, no external lib) ---
 
@@ -850,6 +850,21 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
 };
 
+// Resolve the brain access key from `x-brain-key` header or `?key=` query
+// param. Returns a 401 Response when missing/wrong, or null when the
+// caller should proceed. Hono collapses repeated headers to "v1, v2" and
+// some MCP connectors send keys split across duplicate headers — take the
+// first non-empty token to handle both shapes.
+function requireBrainKey(c: Context): Response | null {
+  const raw = c.req.header("x-brain-key") || "";
+  const headerKey = raw.includes(",") ? raw.split(",")[0].trim() : raw.trim();
+  const provided = headerKey || new URL(c.req.url).searchParams.get("key");
+  if (!provided || provided !== MCP_ACCESS_KEY) {
+    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
+  }
+  return null;
+}
+
 const app = new Hono();
 
 app.get("/healthz", async (c) => {
@@ -967,11 +982,8 @@ app.get("/metrics", async (c) => {
 // from a known point. Same auth as MCP traffic (x-brain-key / ?key=).
 
 app.get("/tail", async (c) => {
-  const provided = c.req.header("x-brain-key") ||
-    new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
-    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
-  }
+  const authError = requireBrainKey(c);
+  if (authError) return authError;
 
   const url = new URL(c.req.url);
   const since = url.searchParams.get("since");
@@ -1062,11 +1074,8 @@ app.get("/tail", async (c) => {
 // can't lose tags. Same auth as MCP traffic.
 
 app.delete("/thoughts/:id", async (c) => {
-  const provided = c.req.header("x-brain-key") ||
-    new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
-    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
-  }
+  const authError = requireBrainKey(c);
+  if (authError) return authError;
   const id = c.req.param("id");
   if (
     !id ||
@@ -1090,11 +1099,8 @@ app.delete("/thoughts/:id", async (c) => {
 });
 
 app.post("/thoughts/:id/metadata", async (c) => {
-  const provided = c.req.header("x-brain-key") ||
-    new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
-    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
-  }
+  const authError = requireBrainKey(c);
+  if (authError) return authError;
 
   const id = c.req.param("id");
   if (
@@ -1159,11 +1165,8 @@ app.post("/thoughts/:id/metadata", async (c) => {
 // Same auth as MCP traffic.
 
 app.post("/admin/backfill-embeddings", async (c) => {
-  const provided = c.req.header("x-brain-key") ||
-    new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
-    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
-  }
+  const authError = requireBrainKey(c);
+  if (authError) return authError;
 
   const url = new URL(c.req.url);
   const limit = Math.min(
@@ -1705,11 +1708,8 @@ app.post("/webhook/github", async (c) => {
 });
 
 app.all("*", async (c) => {
-  const provided = c.req.header("x-brain-key") ||
-    new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
-    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
-  }
+  const authError = requireBrainKey(c);
+  if (authError) return authError;
 
   // Claude Desktop's connector UI doesn't always send the Accept header
   // StreamableHTTPTransport requires. Patch it in if missing.
