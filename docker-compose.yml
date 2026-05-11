@@ -70,6 +70,46 @@ services:
       retries: 6
       start_period: 10s
 
+  # Entity-extraction worker — opt-in via `WORKER=1 make up`. Polls
+  # public.entity_extraction_queue, drains pending rows, writes entities +
+  # thought_entities + thought_entity_edges. Layer-2 trigger maintains
+  # edges.support_count as an aggregate. See server/worker.ts.
+  worker:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    profiles: ["worker"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      ["deno", "run", "--allow-net", "--allow-env", "--allow-read", "worker.ts"]
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-openbrain}
+      DB_USER: ${DB_USER:-openbrain}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      WORKER_POLL_MS: ${WORKER_POLL_MS:-10000}
+      WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}
+      MIN_LINKED_FOR_WIKI: ${MIN_LINKED_FOR_WIKI:-3}
+      WORK_CONTEXT_DESC: ${WORK_CONTEXT_DESC:-}
+      PERSONAL_CONTEXT_DESC: ${PERSONAL_CONTEXT_DESC:-}
+      LLM_MOCK: ${LLM_MOCK:-false}
+      LLM_TRACE: ${LLM_TRACE:-false}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-https://models.github.ai/inference}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-openai/text-embedding-3-small}
+      CHAT_PROVIDER: ${CHAT_PROVIDER:-openai}
+      CHAT_API_BASE: ${CHAT_API_BASE:-}
+      CHAT_API_KEY: ${CHAT_API_KEY:-}
+      CHAT_MODEL: ${CHAT_MODEL:-openai/gpt-4o-mini}
+      ANTHROPIC_API_BASE: ${ANTHROPIC_API_BASE:-https://api.anthropic.com}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_CHAT_MODEL: ${ANTHROPIC_CHAT_MODEL:-claude-haiku-4-5-20251001}
+      ANTHROPIC_VERSION: ${ANTHROPIC_VERSION:-2023-06-01}
+
   # LiteLLM gateway — runs under the `bedrock` profile (real AWS) or
   # `ci-bedrock` profile (mock-openai upstream, no AWS creds needed).
   # Bring up with: BACKEND=bedrock make up

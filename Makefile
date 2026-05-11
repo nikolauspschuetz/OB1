@@ -29,12 +29,17 @@ include $(ENV_FILE)
 export
 endif
 
-# BACKEND=bedrock activates the litellm gateway compose profile.
+# Optional compose-profile flags. Stackable.
+#   BACKEND=bedrock  → enables the litellm gateway
+#   WORKER=1         → enables the entity-extraction worker (server/worker.ts)
 BACKEND ?=
-ifeq ($(BACKEND),bedrock)
-COMPOSE_PROFILES := --profile bedrock
-else
+WORKER ?=
 COMPOSE_PROFILES :=
+ifeq ($(BACKEND),bedrock)
+COMPOSE_PROFILES += --profile bedrock
+endif
+ifneq ($(WORKER),)
+COMPOSE_PROFILES += --profile worker
 endif
 
 COMPOSE   ?= docker compose -p $(PROJECT) --env-file $(ENV_FILE) $(COMPOSE_PROFILES)
@@ -198,6 +203,41 @@ smoke: ci-env ## End-to-end smoke test using LLM_MOCK (no LLM credentials, isola
 	@echo
 	@echo "OK — smoke test passed (capture, embedding insert, search RPC, list, stats)."
 
+smoke-worker: ci-env ## End-to-end worker test using LLM_MOCK stub (no LLM credentials, exercises entity_extraction_queue → entities → thought_entities)
+	@command -v deno >/dev/null 2>&1 || { echo "deno not found — required for obctl. Install: curl -fsSL https://deno.land/install.sh | sh"; exit 1; }
+	@echo "→ booting smoke stack with WORKER=1 and LLM_MOCK=true"
+	@$(COMPOSE_SMOKE) --profile worker down -v >/dev/null 2>&1 || true
+	@LLM_MOCK=true WORKER_POLL_MS=1000 $(COMPOSE_SMOKE) --profile worker up -d --build
+	@echo "→ waiting for /healthz"
+	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
+	  if curl -fsS $(SMOKE_HOST)/healthz >/dev/null 2>&1; then break; fi; sleep 1; \
+	done
+	@curl -fsS $(SMOKE_HOST)/healthz >/dev/null || { echo "  /healthz never came up"; exit 1; }
+	@SENTENCE="WorkerTest sentinel $$(date +%s)"; \
+	KEY=$$(grep -E '^MCP_ACCESS_KEY=' .env.smoke | cut -d= -f2-); \
+	echo "→ obctl capture \"$$SENTENCE\""; \
+	bin/obctl --url=$(SMOKE_HOST) --key=$$KEY capture "$$SENTENCE" >/dev/null; \
+	echo "→ waiting for worker to drain the queue (up to 30s)"; \
+	for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+	  STATUS=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT status FROM entity_extraction_queue ORDER BY queued_at DESC LIMIT 1" 2>/dev/null); \
+	  if [ "$$STATUS" = "complete" ]; then break; fi; sleep 2; \
+	done; \
+	echo "  queue status: $$STATUS"; \
+	[ "$$STATUS" = "complete" ] || { echo "FAIL: worker did not mark queue row complete (last status=$$STATUS)"; $(COMPOSE_SMOKE) --profile worker logs --tail 60 worker; exit 1; }; \
+	echo "→ verifying entities + thought_entities populated"; \
+	ENTITY_COUNT=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM entities" 2>/dev/null); \
+	LINK_COUNT=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM thought_entities" 2>/dev/null); \
+	echo "  entities: $$ENTITY_COUNT, thought_entities: $$LINK_COUNT"; \
+	[ "$$ENTITY_COUNT" -ge 1 ] || { echo "FAIL: no entities created"; exit 1; }; \
+	[ "$$LINK_COUNT" -ge 1 ] || { echo "FAIL: no thought_entities created"; exit 1; }; \
+	echo "→ verifying worker log contains processing line"; \
+	$(COMPOSE_SMOKE) --profile worker logs --tail 30 worker 2>&1 | grep -qE 'Processing |Done ' || { echo "FAIL: worker log missing processing line"; $(COMPOSE_SMOKE) --profile worker logs --tail 60 worker; exit 1; }
+	@echo
+	@echo "→ tearing down smoke-worker stack"
+	@$(COMPOSE_SMOKE) --profile worker down -v >/dev/null 2>&1 || true
+	@echo
+	@echo "OK — smoke-worker passed (queue drained, entities created, thought_entities linked)."
+
 metrics: ## Curl /metrics on the running server (Prometheus text format)
 	@if [ -n "$$METRICS_TOKEN" ]; then \
 	  curl -fsS -H "Authorization: Bearer $$METRICS_TOKEN" $(MCP_HOST)/metrics; \
@@ -340,7 +380,7 @@ ci-env-bedrock: ## Write a stub .env.smoke-bedrock for the Bedrock CI smoke
 	@cp ci/.env.ci-bedrock .env.smoke-bedrock
 	@echo "Wrote .env.smoke-bedrock from ci/.env.ci-bedrock (LLM_MOCK=false, mocked LiteLLM upstream)"
 
-ci: quality smoke smoke-webhook smoke-bedrock ## Run the full CI sequence locally (quality + smoke + smoke-webhook + smoke-bedrock)
+ci: quality smoke smoke-worker smoke-webhook smoke-bedrock ## Run the full CI sequence locally (quality + smoke + smoke-worker + smoke-webhook + smoke-bedrock)
 	@echo
 	@echo "OK — full CI sequence passed locally."
 
