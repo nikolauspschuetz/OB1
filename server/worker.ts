@@ -32,6 +32,7 @@
 
 import { Pool } from "postgres";
 import { chat as llmChat } from "./llm/client.ts";
+import { generateWikiForEntity } from "./wiki.ts";
 
 // --- Config ---
 
@@ -857,6 +858,19 @@ async function filterEntitiesByLinkCount(
   return result.rows.map((r) => Number(r.entity_id));
 }
 
+const WIKI_DISABLE = (Deno.env.get("WIKI_DISABLE") || "").toLowerCase() ===
+  "true";
+
+async function regenWiki(entityId: number): Promise<void> {
+  try {
+    await generateWikiForEntity(entityId);
+  } catch (err) {
+    console.error(
+      `[wiki] entity ${entityId} failed: ${(err as Error).message}`,
+    );
+  }
+}
+
 async function onQueueDrain(): Promise<void> {
   if (dirtyEntityIds.size === 0) return;
   const ids = [...dirtyEntityIds];
@@ -870,14 +884,20 @@ async function onQueueDrain(): Promise<void> {
       } below threshold (${MIN_LINKED_FOR_WIKI})`,
     );
   }
-  if (eligible.length > 0) {
+  if (eligible.length === 0) return;
+  if (WIKI_DISABLE) {
     console.log(
-      `[wiki] ${eligible.length} entit${
-        eligible.length === 1 ? "y" : "ies"
-      } ready for wiki regen ` +
-        `(Phase 3 wiki compiler not yet wired): [${eligible.join(", ")}]`,
+      `[wiki] WIKI_DISABLE=true — would regen [${eligible.join(", ")}]`,
     );
+    return;
   }
+  console.log(
+    `[wiki] Queue drained — regenerating wiki for ${eligible.length} entit${
+      eligible.length === 1 ? "y" : "ies"
+    }...`,
+  );
+  for (const id of eligible) await regenWiki(id);
+  console.log("[wiki] Done.");
 }
 
 // --- Main loop ---

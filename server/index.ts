@@ -774,6 +774,242 @@ server.registerTool(
   },
 );
 
+// --- merge_entities tool — curation primitive ---
+//
+// Merges a source entity into a target. Atomically (single transaction):
+//   1. Re-assign thought_entities rows from source → target, collapsing
+//      duplicates on the (thought_id, entity_id, mention_role) UNIQUE.
+//   2. Re-assign edges in both directions (source as FROM or TO),
+//      collapsing duplicates on (from_entity_id, to_entity_id, relation).
+//   3. Re-assign thought_entity_edges in both directions, collapsing
+//      duplicates — the Layer 2 trigger then recomputes edges.support_count.
+//   4. Union the source's canonical_name + aliases into target.aliases.
+//   5. Insert the source's normalized_name into entity_blocklist with
+//      reason='merged' so it can't be re-created by the worker.
+//   6. Delete the source's wiki_pages row (target's stays).
+//   7. Delete the source entity.
+//
+// Improvement over the upstream Supabase REST version (arpdale fork): wraps
+// everything in BEGIN/COMMIT so a network glitch mid-merge can't half-leave
+// the graph in an inconsistent state.
+
+server.registerTool(
+  "merge_entities",
+  {
+    title: "Merge Entities",
+    description:
+      "Merge a source entity into a target entity. Source's links, edges, and provenance are reassigned to the target; source's canonical_name and aliases are unioned into target.aliases; source is blocklisted so the worker won't re-create it. Use when the LLM extracted two entities that should have been one (e.g. 'Tom' and 'Tom Falconar').",
+    inputSchema: {
+      source_id: z.number().int().describe(
+        "Entity id to merge FROM (will be deleted).",
+      ),
+      target_id: z.number().int().describe(
+        "Entity id to merge INTO (survives).",
+      ),
+    },
+  },
+  async ({ source_id, target_id }) => {
+    if (
+      !Number.isInteger(source_id) || !Number.isInteger(target_id) ||
+      source_id === target_id
+    ) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: "Error: source_id and target_id must be distinct integers.",
+        }],
+        isError: true,
+      };
+    }
+    const client = await pool.connect();
+    try {
+      await client.queryArray("BEGIN");
+
+      const sourceRow = await client.queryObject<{
+        canonical_name: string;
+        aliases: unknown;
+        entity_type: string;
+        normalized_name: string;
+      }>(
+        `SELECT canonical_name, aliases, entity_type, normalized_name
+           FROM entities WHERE id = $1`,
+        [source_id],
+      );
+      if (sourceRow.rows.length === 0) {
+        await client.queryArray("ROLLBACK");
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Error: source entity ${source_id} not found.`,
+          }],
+          isError: true,
+        };
+      }
+      const source = sourceRow.rows[0];
+
+      const targetRow = await client.queryObject<{
+        canonical_name: string;
+        aliases: unknown;
+      }>(
+        `SELECT canonical_name, aliases FROM entities WHERE id = $1`,
+        [target_id],
+      );
+      if (targetRow.rows.length === 0) {
+        await client.queryArray("ROLLBACK");
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              `Error: target entity ${target_id} not found (may have been previously deleted or merged).`,
+          }],
+          isError: true,
+        };
+      }
+      const target = targetRow.rows[0];
+
+      // 1. thought_entities: re-point to target, drop dups via INSERT
+      // ON CONFLICT DO NOTHING, then delete the source's rows.
+      await client.queryArray(
+        `INSERT INTO thought_entities
+           (thought_id, entity_id, mention_role, confidence, source, evidence)
+         SELECT thought_id, $2, mention_role, confidence, source, evidence
+           FROM thought_entities WHERE entity_id = $1
+         ON CONFLICT (thought_id, entity_id, mention_role) DO NOTHING`,
+        [source_id, target_id],
+      );
+      await client.queryArray(
+        `DELETE FROM thought_entities WHERE entity_id = $1`,
+        [source_id],
+      );
+
+      // 2. edges as FROM: re-point, drop conflicting dups
+      await client.queryArray(
+        `INSERT INTO edges
+           (from_entity_id, to_entity_id, relation, support_count, confidence, metadata)
+         SELECT $2, to_entity_id, relation, support_count, confidence, metadata
+           FROM edges WHERE from_entity_id = $1
+         ON CONFLICT (from_entity_id, to_entity_id, relation) DO NOTHING`,
+        [source_id, target_id],
+      );
+      await client.queryArray(
+        `DELETE FROM edges WHERE from_entity_id = $1`,
+        [source_id],
+      );
+      // edges as TO
+      await client.queryArray(
+        `INSERT INTO edges
+           (from_entity_id, to_entity_id, relation, support_count, confidence, metadata)
+         SELECT from_entity_id, $2, relation, support_count, confidence, metadata
+           FROM edges WHERE to_entity_id = $1
+         ON CONFLICT (from_entity_id, to_entity_id, relation) DO NOTHING`,
+        [source_id, target_id],
+      );
+      await client.queryArray(
+        `DELETE FROM edges WHERE to_entity_id = $1`,
+        [source_id],
+      );
+
+      // 3. thought_entity_edges (Layer 2 provenance) in both directions.
+      // The trigger fires once per row, recomputing edges.support_count.
+      await client.queryArray(
+        `INSERT INTO thought_entity_edges
+           (thought_id, from_entity_id, to_entity_id, relation, confidence)
+         SELECT thought_id, $2, to_entity_id, relation, confidence
+           FROM thought_entity_edges WHERE from_entity_id = $1
+         ON CONFLICT (thought_id, from_entity_id, to_entity_id, relation) DO NOTHING`,
+        [source_id, target_id],
+      );
+      await client.queryArray(
+        `DELETE FROM thought_entity_edges WHERE from_entity_id = $1`,
+        [source_id],
+      );
+      await client.queryArray(
+        `INSERT INTO thought_entity_edges
+           (thought_id, from_entity_id, to_entity_id, relation, confidence)
+         SELECT thought_id, from_entity_id, $2, relation, confidence
+           FROM thought_entity_edges WHERE to_entity_id = $1
+         ON CONFLICT (thought_id, from_entity_id, to_entity_id, relation) DO NOTHING`,
+        [source_id, target_id],
+      );
+      await client.queryArray(
+        `DELETE FROM thought_entity_edges WHERE to_entity_id = $1`,
+        [source_id],
+      );
+
+      // 4. Union aliases. Target.aliases ∪ source.aliases ∪ {source.canonical_name}.
+      const srcAliases = Array.isArray(source.aliases)
+        ? source.aliases as string[]
+        : [];
+      const tgtAliases = Array.isArray(target.aliases)
+        ? target.aliases as string[]
+        : [];
+      const combined = Array.from(
+        new Set([...tgtAliases, ...srcAliases, source.canonical_name]),
+      );
+      await client.queryArray(
+        `UPDATE entities SET aliases = $1::jsonb, updated_at = now()
+           WHERE id = $2`,
+        [JSON.stringify(combined), target_id],
+      );
+
+      // 5. Blocklist source's name (entity_blocklist gate is creation-only).
+      await client.queryArray(
+        `INSERT INTO entity_blocklist (entity_type, normalized_name, reason)
+         VALUES ($1, $2, 'merged')
+         ON CONFLICT (entity_type, normalized_name) DO UPDATE
+           SET reason = 'merged', blocked_at = now()`,
+        [source.entity_type, source.normalized_name],
+      );
+
+      // 6. Delete source's wiki page (target's stays).
+      await client.queryArray(
+        `DELETE FROM wiki_pages WHERE entity_id = $1`,
+        [source_id],
+      );
+
+      // 7. Delete source entity.
+      await client.queryArray(
+        `DELETE FROM entities WHERE id = $1`,
+        [source_id],
+      );
+
+      // 8. Audit log row.
+      await client.queryArray(
+        `INSERT INTO consolidation_log
+           (operation, survivor_id, loser_id, details)
+         VALUES ('entity_merge', NULL, NULL,
+           jsonb_build_object(
+             'source_entity_id', $1::bigint,
+             'target_entity_id', $2::bigint,
+             'source_canonical_name', $3::text,
+             'target_canonical_name', $4::text
+           ))`,
+        [source_id, target_id, source.canonical_name, target.canonical_name],
+      );
+
+      await client.queryArray("COMMIT");
+      return {
+        content: [{
+          type: "text" as const,
+          text:
+            `Merged entity #${source_id} (${source.canonical_name}) into #${target_id} (${target.canonical_name}). Source blocklisted.`,
+        }],
+      };
+    } catch (err: unknown) {
+      await client.queryArray("ROLLBACK").catch(() => {});
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Error: ${(err as Error).message}`,
+        }],
+        isError: true,
+      };
+    } finally {
+      client.release();
+    }
+  },
+);
+
 // --- HTTP layer (Hono) with auth + CORS ---
 
 const corsHeaders = {

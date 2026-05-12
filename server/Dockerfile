@@ -8,6 +8,8 @@ RUN deno install
 
 COPY index.ts ./
 COPY worker.ts ./
+COPY wiki.ts ./
+COPY classify.ts ./
 COPY llm/ ./llm/
 
 # Run as the unprivileged user shipped with the deno image

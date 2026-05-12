@@ -203,40 +203,87 @@ smoke: ci-env ## End-to-end smoke test using LLM_MOCK (no LLM credentials, isola
 	@echo
 	@echo "OK — smoke test passed (capture, embedding insert, search RPC, list, stats)."
 
-smoke-worker: ci-env ## End-to-end worker test using LLM_MOCK stub (no LLM credentials, exercises entity_extraction_queue → entities → thought_entities)
+classify-edges: ## Run the typed-edge classifier batch (requires WORKER=1 stack up). Optional: LIMIT=N MIN_CONF=0.75
+	@$(COMPOSE) exec worker deno run --allow-net --allow-env --allow-read /app/classify.ts \
+	  --limit $(or $(LIMIT),50) --min-confidence $(or $(MIN_CONF),0.75)
+
+smoke-worker: ci-env ## End-to-end worker test using LLM_MOCK stub (no LLM credentials, exercises entity_extraction_queue → entities → thought_entities → wiki_pages → thought_edges)
 	@command -v deno >/dev/null 2>&1 || { echo "deno not found — required for obctl. Install: curl -fsSL https://deno.land/install.sh | sh"; exit 1; }
 	@echo "→ booting smoke stack with WORKER=1 and LLM_MOCK=true"
 	@$(COMPOSE_SMOKE) --profile worker down -v >/dev/null 2>&1 || true
-	@LLM_MOCK=true WORKER_POLL_MS=1000 $(COMPOSE_SMOKE) --profile worker up -d --build
+	@LLM_MOCK=true WORKER_POLL_MS=1000 MIN_LINKED_FOR_WIKI=1 $(COMPOSE_SMOKE) --profile worker up -d --build
 	@echo "→ waiting for /healthz"
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
 	  if curl -fsS $(SMOKE_HOST)/healthz >/dev/null 2>&1; then break; fi; sleep 1; \
 	done
 	@curl -fsS $(SMOKE_HOST)/healthz >/dev/null || { echo "  /healthz never came up"; exit 1; }
-	@SENTENCE="WorkerTest sentinel $$(date +%s)"; \
-	KEY=$$(grep -E '^MCP_ACCESS_KEY=' .env.smoke | cut -d= -f2-); \
-	echo "→ obctl capture \"$$SENTENCE\""; \
-	bin/obctl --url=$(SMOKE_HOST) --key=$$KEY capture "$$SENTENCE" >/dev/null; \
-	echo "→ waiting for worker to drain the queue (up to 30s)"; \
+	@KEY=$$(grep -E '^MCP_ACCESS_KEY=' .env.smoke | cut -d= -f2-); \
+	STAMP=$$(date +%s); \
+	echo "→ obctl capture (2 thoughts with same first word — exercises classifier candidate path)"; \
+	bin/obctl --url=$(SMOKE_HOST) --key=$$KEY capture "WorkerTest first sentinel $$STAMP" >/dev/null; \
+	bin/obctl --url=$(SMOKE_HOST) --key=$$KEY capture "WorkerTest second sentinel $$STAMP" >/dev/null; \
+	echo "→ waiting for worker to drain both rows (up to 30s)"; \
 	for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	  STATUS=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT status FROM entity_extraction_queue ORDER BY queued_at DESC LIMIT 1" 2>/dev/null); \
-	  if [ "$$STATUS" = "complete" ]; then break; fi; sleep 2; \
+	  PENDING=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM entity_extraction_queue WHERE status <> 'complete'" 2>/dev/null); \
+	  if [ "$$PENDING" = "0" ]; then break; fi; sleep 2; \
 	done; \
-	echo "  queue status: $$STATUS"; \
-	[ "$$STATUS" = "complete" ] || { echo "FAIL: worker did not mark queue row complete (last status=$$STATUS)"; $(COMPOSE_SMOKE) --profile worker logs --tail 60 worker; exit 1; }; \
-	echo "→ verifying entities + thought_entities populated"; \
+	echo "  pending rows: $$PENDING (expect 0)"; \
+	[ "$$PENDING" = "0" ] || { echo "FAIL: worker did not drain queue"; $(COMPOSE_SMOKE) --profile worker logs --tail 60 worker; exit 1; }; \
+	echo "→ verifying entities + thought_entities populated (dedup means 2 thoughts → 1 entity)"; \
 	ENTITY_COUNT=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM entities" 2>/dev/null); \
 	LINK_COUNT=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM thought_entities" 2>/dev/null); \
 	echo "  entities: $$ENTITY_COUNT, thought_entities: $$LINK_COUNT"; \
 	[ "$$ENTITY_COUNT" -ge 1 ] || { echo "FAIL: no entities created"; exit 1; }; \
-	[ "$$LINK_COUNT" -ge 1 ] || { echo "FAIL: no thought_entities created"; exit 1; }; \
+	[ "$$LINK_COUNT" -ge 2 ] || { echo "FAIL: expected >=2 thought_entities (one per thought sharing an entity), got $$LINK_COUNT"; exit 1; }; \
+	echo "→ waiting for wiki_pages row (worker spawns wiki.ts on queue drain, up to 30s)"; \
+	for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+	  WIKI_COUNT=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM wiki_pages" 2>/dev/null); \
+	  if [ "$$WIKI_COUNT" -ge 1 ]; then break; fi; sleep 2; \
+	done; \
+	echo "  wiki_pages: $$WIKI_COUNT"; \
+	[ "$$WIKI_COUNT" -ge 1 ] || { echo "FAIL: wiki_pages row never appeared"; $(COMPOSE_SMOKE) --profile worker logs --tail 80 worker; exit 1; }; \
+	echo "→ verifying wiki content starts with entity heading"; \
+	WIKI_TITLE=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT substring(content, 1, 80) FROM wiki_pages LIMIT 1" 2>/dev/null); \
+	echo "  first 80 chars: $$WIKI_TITLE"; \
+	echo "$$WIKI_TITLE" | grep -qE '^# ' || { echo "FAIL: wiki content does not start with # heading"; exit 1; }; \
 	echo "→ verifying worker log contains processing line"; \
-	$(COMPOSE_SMOKE) --profile worker logs --tail 30 worker 2>&1 | grep -qE 'Processing |Done ' || { echo "FAIL: worker log missing processing line"; $(COMPOSE_SMOKE) --profile worker logs --tail 60 worker; exit 1; }
+	$(COMPOSE_SMOKE) --profile worker logs --tail 50 worker 2>&1 | grep -qE 'Processing |Done ' || { echo "FAIL: worker log missing processing line"; $(COMPOSE_SMOKE) --profile worker logs --tail 60 worker; exit 1; }; \
+	echo "→ running typed-edge classifier (LLM_MOCK emits a related_to edge per candidate pair)"; \
+	$(COMPOSE_SMOKE) --profile worker exec -T worker deno run --allow-net --allow-env --allow-read /app/classify.ts --limit 20 --min-confidence 0.5 || { echo "FAIL: classifier exited non-zero"; exit 1; }; \
+	echo "→ verifying thought_edges row created"; \
+	EDGE_COUNT=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM thought_edges" 2>/dev/null); \
+	echo "  thought_edges: $$EDGE_COUNT"; \
+	[ "$$EDGE_COUNT" -ge 1 ] || { echo "FAIL: classifier did not write a thought_edges row"; exit 1; }; \
+	echo "→ exercising merge_entities tool (create second entity, then merge)"; \
+	bin/obctl --url=$(SMOKE_HOST) --key=$$KEY capture "SecondEntity sentinel $$STAMP" >/dev/null; \
+	for i in 1 2 3 4 5 6 7 8 9 10; do \
+	  COUNT=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM entities" 2>/dev/null); \
+	  if [ "$$COUNT" -ge 2 ]; then break; fi; sleep 2; \
+	done; \
+	IDS=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT string_agg(id::text, ',' ORDER BY id) FROM entities" 2>/dev/null); \
+	SRC=$$(echo $$IDS | cut -d, -f1); TGT=$$(echo $$IDS | cut -d, -f2); \
+	echo "  merging source=$$SRC into target=$$TGT"; \
+	curl -fsS -X POST $(SMOKE_HOST)/mcp \
+	  -H "x-brain-key: $$KEY" \
+	  -H "Accept: application/json, text/event-stream" \
+	  -H "Content-Type: application/json" \
+	  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_entities\",\"arguments\":{\"source_id\":$$SRC,\"target_id\":$$TGT}}}" \
+	  | grep -qE '"merged"|Merged entity' || { echo "FAIL: merge_entities response missing success marker"; exit 1; }; \
+	echo "→ verifying merge effects"; \
+	REMAINING=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM entities WHERE id = $$SRC" 2>/dev/null); \
+	BLOCKED=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM entity_blocklist WHERE reason = 'merged'" 2>/dev/null); \
+	LOG=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM consolidation_log WHERE operation = 'entity_merge'" 2>/dev/null); \
+	echo "  source entity remaining: $$REMAINING (expect 0)"; \
+	echo "  entity_blocklist 'merged' rows: $$BLOCKED (expect 1)"; \
+	echo "  consolidation_log entity_merge rows: $$LOG (expect 1)"; \
+	[ "$$REMAINING" = "0" ] || { echo "FAIL: source entity not deleted"; exit 1; }; \
+	[ "$$BLOCKED" -ge 1 ] || { echo "FAIL: blocklist row not created"; exit 1; }; \
+	[ "$$LOG" -ge 1 ] || { echo "FAIL: audit log not written"; exit 1; }
 	@echo
 	@echo "→ tearing down smoke-worker stack"
 	@$(COMPOSE_SMOKE) --profile worker down -v >/dev/null 2>&1 || true
 	@echo
-	@echo "OK — smoke-worker passed (queue drained, entities created, thought_entities linked)."
+	@echo "OK — smoke-worker passed (worker → wiki → thought_edges → merge_entities all exercised)."
 
 metrics: ## Curl /metrics on the running server (Prometheus text format)
 	@if [ -n "$$METRICS_TOKEN" ]; then \
