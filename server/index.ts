@@ -1578,6 +1578,84 @@ app.get("/tail", async (c) => {
   }
 });
 
+// --- /dashboard-api/* — internal endpoints for the dashboard ---
+//
+// These wrap the LLM wrapper for the dashboard so the dashboard process
+// itself doesn't need provider credentials. Same x-brain-key auth.
+
+app.post("/dashboard-api/embed", async (c) => {
+  const authError = requireBrainKey(c);
+  if (authError) return authError;
+  let body: { text?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid json body" }, 400, corsHeaders);
+  }
+  const text = (body.text ?? "").trim();
+  if (!text) {
+    return c.json({ error: "text required" }, 400, corsHeaders);
+  }
+  try {
+    const result = await llmEmbed({ input: text.slice(0, 8000) });
+    return c.json({ embedding: result.embeddings[0] ?? [] }, 200, corsHeaders);
+  } catch (err) {
+    return c.json(
+      { error: (err as Error).message },
+      502,
+      corsHeaders,
+    );
+  }
+});
+
+app.post("/dashboard-api/synthesize", async (c) => {
+  const authError = requireBrainKey(c);
+  if (authError) return authError;
+  let body: {
+    query?: string;
+    passages?: Array<{ id: string; content: string }>;
+  };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid json body" }, 400, corsHeaders);
+  }
+  const query = (body.query ?? "").trim();
+  const passages = Array.isArray(body.passages)
+    ? body.passages.slice(0, 8)
+    : [];
+  if (!query || passages.length === 0) {
+    return c.json({ error: "query and passages required" }, 400, corsHeaders);
+  }
+  const passageText = passages
+    .map((p, i) =>
+      `[${i + 1}] (id=${p.id.slice(0, 8)}) ${p.content.slice(0, 1200)}`
+    )
+    .join("\n\n");
+  try {
+    const result = await llmChat({
+      system:
+        "You are answering a question using ONLY the supplied passages from the user's personal Open Brain. Cite sources inline as [1], [2] keyed to the bracketed passage numbers. Be concise (3-5 sentences). If the passages don't answer the question, say so directly.",
+      messages: [{
+        role: "user",
+        content: `Question: ${query}\n\nPassages:\n${passageText}`,
+      }],
+      maxTokens: 512,
+    });
+    return c.json(
+      { answer: result.text, sources: passages.map((p) => p.id) },
+      200,
+      corsHeaders,
+    );
+  } catch (err) {
+    return c.json(
+      { error: (err as Error).message },
+      502,
+      corsHeaders,
+    );
+  }
+});
+
 // --- Metadata-only updates (no re-embedding) ---
 //
 // POST /thoughts/:id/metadata

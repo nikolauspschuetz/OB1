@@ -162,5 +162,40 @@ services:
       retries: 10
       start_period: 5s
 
+  # Next.js dashboard — opt-in via `DASHBOARD=1 make up`. Read path
+  # talks directly to Postgres; write path POSTs to the MCP server's
+  # tool surface so we never duplicate business logic.
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    profiles: ["dashboard"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      mcp:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-openbrain}
+      DB_USER: ${DB_USER:-openbrain}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      OB1_MCP_URL: http://mcp:8000
+      OB1_MCP_KEY: ${MCP_ACCESS_KEY:?MCP_ACCESS_KEY must be set in .env}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD must be set in .env to enable the dashboard profile}
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:-${MCP_ACCESS_KEY}}
+      DASHBOARD_SESSION_MAX_AGE: ${DASHBOARD_SESSION_MAX_AGE:-604800}
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/login >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
 volumes:
   ob1-db-data: {}

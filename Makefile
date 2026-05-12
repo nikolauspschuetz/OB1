@@ -32,14 +32,19 @@ endif
 # Optional compose-profile flags. Stackable.
 #   BACKEND=bedrock  → enables the litellm gateway
 #   WORKER=1         → enables the entity-extraction worker (server/worker.ts)
+#   DASHBOARD=1      → enables the Next.js dashboard (dashboard/)
 BACKEND ?=
 WORKER ?=
+DASHBOARD ?=
 COMPOSE_PROFILES :=
 ifeq ($(BACKEND),bedrock)
 COMPOSE_PROFILES += --profile bedrock
 endif
 ifneq ($(WORKER),)
 COMPOSE_PROFILES += --profile worker
+endif
+ifneq ($(DASHBOARD),)
+COMPOSE_PROFILES += --profile dashboard
 endif
 
 COMPOSE   ?= docker compose -p $(PROJECT) --env-file $(ENV_FILE) $(COMPOSE_PROFILES)
@@ -150,6 +155,11 @@ urls: ## Print the MCP server URL and connection URL for AI clients
 	@echo "MCP Server URL:     $(MCP_HOST)"
 	@echo "MCP Connection URL: $(MCP_HOST)?key=$$MCP_ACCESS_KEY"
 	@echo "Header alternative: -H 'x-brain-key: $$MCP_ACCESS_KEY'"
+	@if [ -n "$(DASHBOARD)" ]; then \
+	  DPORT=$$(grep -E '^DASHBOARD_PORT=' $(ENV_FILE) | cut -d= -f2-); \
+	  DPORT=$${DPORT:-3000}; \
+	  echo "Dashboard URL:      http://localhost:$$DPORT"; \
+	fi
 
 rotate-key: ## Generate a new MCP_ACCESS_KEY in the active profile's env file and restart the server
 	@KEY=$$(openssl rand -hex 32); \

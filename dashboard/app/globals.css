@@ -1,0 +1,103 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0b0e14;
+  --color-bg-elev: #11161e;
+  --color-border: #1e2630;
+  --color-text: #d8dee9;
+  --color-text-dim: #8b95a5;
+  --color-accent: #7aa2f7;
+  --color-accent-soft: #2a3550;
+}
+
+html, body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "SF Pro Text",
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-feature-settings: "ss01", "cv11";
+}
+
+a { color: var(--color-accent); }
+a:hover { text-decoration: underline; }
+
+pre, code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+.card {
+  background: var(--color-bg-elev);
+  border: 1px solid var(--color-border);
+  border-radius: 0.5rem;
+}
+
+.btn {
+  display: inline-block;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  background: var(--color-bg-elev);
+  color: var(--color-text);
+  cursor: pointer;
+  font-size: 0.875rem;
+}
+.btn:hover { border-color: var(--color-accent); }
+.btn-danger { color: #f7768e; }
+.btn-primary { color: var(--color-accent); }
+
+.kbd {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.75rem;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.25rem;
+  background: var(--color-bg-elev);
+  color: var(--color-text-dim);
+}
+
+.prose-ob1 h1, .prose-ob1 h2, .prose-ob1 h3 {
+  font-weight: 600;
+  margin-top: 1.2em;
+  margin-bottom: 0.4em;
+  color: var(--color-text);
+}
+.prose-ob1 h1 { font-size: 1.6rem; }
+.prose-ob1 h2 { font-size: 1.3rem; }
+.prose-ob1 h3 { font-size: 1.1rem; }
+.prose-ob1 p { margin: 0.6em 0; line-height: 1.6; }
+.prose-ob1 ul, .prose-ob1 ol { margin: 0.6em 0; padding-left: 1.4em; }
+.prose-ob1 li { margin: 0.2em 0; }
+.prose-ob1 code {
+  background: var(--color-bg-elev);
+  padding: 0.1em 0.3em;
+  border-radius: 0.2em;
+  font-size: 0.9em;
+}
+.prose-ob1 pre {
+  background: var(--color-bg-elev);
+  padding: 0.8em;
+  border-radius: 0.4em;
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+}
+.prose-ob1 blockquote {
+  border-left: 3px solid var(--color-accent);
+  padding-left: 0.8em;
+  color: var(--color-text-dim);
+  margin: 0.6em 0;
+}
+.prose-ob1 a {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.prose-ob1 table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+}
+.prose-ob1 th, .prose-ob1 td {
+  border: 1px solid var(--color-border);
+  padding: 0.3em 0.6em;
+  text-align: left;
+}
