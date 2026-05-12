@@ -88,7 +88,7 @@ async function withClient<T>(fn: (c: DbClient) => Promise<T>): Promise<T> {
 async function resolveEntity(id: number): Promise<Entity | null> {
   const result = await withClient((c) =>
     c.queryObject<Entity>(
-      `SELECT id, entity_type, canonical_name, normalized_name
+      `SELECT id::int AS id, entity_type, canonical_name, normalized_name
        FROM entities WHERE id = $1`,
       [id],
     )
@@ -119,8 +119,10 @@ async function fetchLinkedThoughts(
 async function fetchTypedEdges(entityId: number): Promise<TypedEdge[]> {
   const result = await withClient((c) =>
     c.queryObject<TypedEdge>(
-      `SELECT from_entity_id, to_entity_id, relation,
-              support_count
+      `SELECT from_entity_id::int AS from_entity_id,
+              to_entity_id::int   AS to_entity_id,
+              relation,
+              support_count::int  AS support_count
        FROM edges
        WHERE (from_entity_id = $1 OR to_entity_id = $1)
          AND relation <> 'co_occurs_with'
@@ -138,7 +140,7 @@ async function fetchEntityNames(
   if (ids.length === 0) return new Map();
   const result = await withClient((c) =>
     c.queryObject<{ id: number; canonical_name: string; entity_type: string }>(
-      `SELECT id, canonical_name, entity_type FROM entities
+      `SELECT id::int AS id, canonical_name, entity_type FROM entities
         WHERE id = ANY($1::bigint[])`,
       [ids],
     )

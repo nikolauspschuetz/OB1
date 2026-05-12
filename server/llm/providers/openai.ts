@@ -35,10 +35,13 @@ export async function openaiChat(
   };
   if (req.maxTokens) body.max_tokens = req.maxTokens;
   if (req.json) body.response_format = { type: "json_object" };
-  // disableThinking: maps to think:false on OpenRouter-style upstreams that
-  // proxy Qwen3. GitHub Models silently ignores. LiteLLM->Bedrock-Anthropic
-  // 400s — but client.ts has already silent-dropped this for tag=="bedrock".
-  if (req.disableThinking) body.think = false;
+  // disableThinking: deliberately NOT sent as a body parameter. GitHub
+  // Models tightened its API to reject unknown fields, and there's no
+  // single shape that works across openai-shaped upstreams (GitHub
+  // Models, OpenRouter, OpenAI direct, LiteLLM→Bedrock-Anthropic, plain
+  // Ollama /v1). The portable substitute is the `/no_think` directive
+  // prepended to the prompt by the Ollama provider; openai-shaped paths
+  // ignore the flag here.
 
   const r = await fetch(`${cfg.apiBase}/chat/completions`, {
     method: "POST",
