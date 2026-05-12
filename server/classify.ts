@@ -192,6 +192,41 @@ B (id=${c.to_id.slice(0, 8)}, date=${c.to_date}):
 ${c.to_content.slice(0, 800)}`;
 }
 
+// Cheap pre-filter: ~100 tokens in, ~30 out. Asks the model whether the
+// pair is worth deep classification at all. Skipping this halves the
+// classifier's token bill on paid providers (Anthropic/Bedrock); leaves
+// throughput unchanged on Ollama/mock. Caller bypasses the prefilter
+// when `--skip-prefilter` is set.
+
+const PREFILTER_SYSTEM =
+  `You are a fast pre-filter for a reasoning-edge classifier. Given two thoughts, answer whether there is ANY meaningful semantic relation beyond simple co-mention (one of: supports, contradicts, evolved_into, supersedes, depends_on). Reply with strict JSON only, no markdown:
+{"worth_classifying": true|false, "hunch": "<one-word relation or none>"}`;
+
+function buildPrefilterMessage(c: Candidate): string {
+  return `A: ${c.from_content.slice(0, 400)}
+
+B: ${c.to_content.slice(0, 400)}`;
+}
+
+async function prefilterPair(c: Candidate): Promise<boolean> {
+  if (LLM_MOCK) return true; // mock always wants to classify
+  try {
+    const result = await llmChat({
+      system: PREFILTER_SYSTEM,
+      messages: [{ role: "user", content: buildPrefilterMessage(c) }],
+      json: true,
+      disableThinking: true,
+      temperature: 0,
+      maxTokens: 128,
+    });
+    const parsed = JSON.parse(result.text) as { worth_classifying?: boolean };
+    return parsed.worth_classifying === true;
+  } catch {
+    // Pre-filter failure is non-fatal: fall through to expensive classifier.
+    return true;
+  }
+}
+
 async function classifyPair(c: Candidate): Promise<Classification | null> {
   if (LLM_MOCK) {
     return {
@@ -250,19 +285,37 @@ async function classifyPair(c: Candidate): Promise<Classification | null> {
 interface RunOptions {
   limit: number;
   minConfidence: number;
+  skipPrefilter: boolean;
 }
 
 export async function classifyEdges(
   options: RunOptions,
-): Promise<{ classified: number; skipped: number; written: number }> {
+): Promise<
+  {
+    classified: number;
+    prefiltered_out: number;
+    skipped: number;
+    written: number;
+  }
+> {
   const candidates = await fetchCandidates(options.limit);
   console.log(
-    `[classify] ${candidates.length} candidate pair(s). min-confidence=${options.minConfidence}`,
+    `[classify] ${candidates.length} candidate pair(s). min-confidence=${options.minConfidence} prefilter=${
+      options.skipPrefilter ? "off" : "on"
+    }`,
   );
 
   let written = 0;
   let skipped = 0;
+  let prefiltered_out = 0;
   for (const c of candidates) {
+    if (!options.skipPrefilter) {
+      const worth = await prefilterPair(c);
+      if (!worth) {
+        prefiltered_out++;
+        continue;
+      }
+    }
     const cls = await classifyPair(c);
     if (!cls) {
       skipped++;
@@ -278,8 +331,6 @@ export async function classifyEdges(
       fromId = c.to_id;
       toId = c.from_id;
     } else if (cls.direction === "symmetric") {
-      // Stable ordering for symmetric edges so the UNIQUE constraint
-      // collapses both insertion orders.
       if (fromId > toId) [fromId, toId] = [toId, fromId];
     }
     await upsertEdge(
@@ -293,13 +344,19 @@ export async function classifyEdges(
     );
     written++;
   }
-  return { classified: candidates.length, skipped, written };
+  return {
+    classified: candidates.length,
+    prefiltered_out,
+    skipped,
+    written,
+  };
 }
 
-function parseCliArgs(): { limit: number; minConfidence: number } {
+function parseCliArgs(): RunOptions {
   const args = Deno.args;
   let limit = 50;
   let minConfidence = 0.75;
+  let skipPrefilter = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--limit" && args[i + 1]) {
       limit = parseInt(args[i + 1], 10);
@@ -307,9 +364,11 @@ function parseCliArgs(): { limit: number; minConfidence: number } {
     } else if (args[i] === "--min-confidence" && args[i + 1]) {
       minConfidence = parseFloat(args[i + 1]);
       i++;
+    } else if (args[i] === "--skip-prefilter") {
+      skipPrefilter = true;
     }
   }
-  return { limit, minConfidence };
+  return { limit, minConfidence, skipPrefilter };
 }
 
 if (import.meta.main) {
@@ -317,7 +376,7 @@ if (import.meta.main) {
   try {
     const out = await classifyEdges(opts);
     console.log(
-      `[classify] done: ${out.written} edge(s) written, ${out.skipped} skipped, ${out.classified} pair(s) examined`,
+      `[classify] done: ${out.written} edge(s) written, ${out.skipped} skipped, ${out.prefiltered_out} prefilter-rejected, ${out.classified} pair(s) examined`,
     );
     Deno.exit(0);
   } catch (err) {

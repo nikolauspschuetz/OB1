@@ -174,6 +174,10 @@ Usage:
   obctl unbookmark <id>         Alias for: bookmark <id> --remove
   obctl tag <id> [--add X] [--remove X]
                                 Add or remove topic X from metadata.topics
+  obctl update <id> [--content X] [--type T] [--importance N] [--meta-key=V ...]
+                                Structured edit; every change written to attribution_log.
+  obctl merge <source-entity-id> <target-entity-id>
+                                Merge entity into another (transactional curation).
   obctl forget <id> [--yes]     Permanently delete a thought (prompts unless --yes)
   obctl health                  Health check
   obctl help                    This message
@@ -340,6 +344,74 @@ try {
     }
     case "stats": {
       printToolResult(await callTool("thought_stats", {}));
+      break;
+    }
+    case "update": {
+      const id = positional[0];
+      if (!id) {
+        console.error(
+          "Provide a thought id: obctl update <id> [--content X] [--type T] [--importance N]",
+        );
+        Deno.exit(2);
+      }
+      const params: Record<string, unknown> = { id };
+      if (flags.content !== undefined) params.content = String(flags.content);
+      if (flags.type !== undefined) params.type = String(flags.type);
+      if (flags.importance !== undefined) {
+        params.importance = Number(flags.importance);
+      }
+      // Collect --meta-foo=bar flags into a metadata merge object.
+      const meta: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(flags)) {
+        if (!k.startsWith("meta-")) continue;
+        const key = k.slice("meta-".length);
+        if (!key) continue;
+        meta[key] = v;
+      }
+      if (Object.keys(meta).length > 0) params.metadata = meta;
+      params.actor = String(flags.actor ?? "obctl");
+      if (
+        params.content === undefined && params.type === undefined &&
+        params.importance === undefined && params.metadata === undefined
+      ) {
+        console.error(
+          "Provide at least one of: --content X / --type T / --importance N / --meta-key=value",
+        );
+        Deno.exit(2);
+      }
+      printToolResult(await callTool("update_thought", params));
+      break;
+    }
+    case "merge": {
+      const sourceArg = positional[0];
+      const targetArg = positional[1];
+      const source_id = Number(sourceArg);
+      const target_id = Number(targetArg);
+      if (
+        !Number.isInteger(source_id) || !Number.isInteger(target_id) ||
+        source_id === target_id
+      ) {
+        console.error(
+          "Provide two distinct integer entity ids: obctl merge <source-id> <target-id>",
+        );
+        Deno.exit(2);
+      }
+      if (!flags.yes) {
+        await Deno.stderr.write(
+          new TextEncoder().encode(
+            `Merge entity ${source_id} into ${target_id}? Source will be DELETED and blocklisted. [y/N] `,
+          ),
+        );
+        const buf = new Uint8Array(8);
+        const n = await Deno.stdin.read(buf) ?? 0;
+        const ans = new TextDecoder().decode(buf.slice(0, n)).trim()
+          .toLowerCase();
+        if (ans !== "y" && ans !== "yes") {
+          console.error("Aborted.");
+          Deno.exit(1);
+        }
+      }
+      printToolResult(await callTool("merge_entities", { source_id, target_id }));
       break;
     }
     case "forget": {
