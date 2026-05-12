@@ -462,12 +462,170 @@ async function captureThought(
 
 const server = new McpServer({ name: "open-brain", version: "1.0.0" });
 
+// CITATION_BASE_URL is the prefix used to build the `url` field returned by
+// the ChatGPT-compat `search` and `fetch` tools. ChatGPT renders the URL as
+// the citation target. If you front the server with a real dashboard, point
+// this at it (e.g. https://brain.example.com/thoughts). The default is a
+// local placeholder — ChatGPT won't dereference it but it satisfies the
+// schema and is harmless.
+const CITATION_BASE_URL = Deno.env.get("CITATION_BASE_URL") ||
+  "https://openbrain.local/thoughts";
+
+function thoughtTitle(content: string, createdAt?: string): string {
+  const firstLine = content.replace(/\s+/g, " ").trim().slice(0, 80);
+  const datePrefix = createdAt
+    ? new Date(createdAt).toLocaleDateString()
+    : "Open Brain";
+  return firstLine ? `${datePrefix} - ${firstLine}` : `${datePrefix} thought`;
+}
+
+function thoughtUrl(id: string): string {
+  return `${CITATION_BASE_URL.replace(/\/$/, "")}/${id}`;
+}
+
+// ChatGPT's restricted MCP connector surface (Settings -> Connectors ->
+// Open Brain) only invokes tools named `search` and `fetch` with a strict
+// id/title/url/text/metadata shape. Distinct from search_thoughts because:
+//   - search returns {id, title, url} only (no preview, no similarity, no
+//     metadata) — ChatGPT cites by id and re-fetches when it wants content.
+//   - fetch returns the full document for a single id.
+// readOnlyHint:true tells the host these are safe for restricted contexts
+// like company-knowledge connectors and deep research.
+
+server.registerTool(
+  "search",
+  {
+    title: "Search Open Brain",
+    description:
+      "Search Open Brain memories by meaning. ChatGPT-compatibility tool. Returns id/title/url triples; call fetch(id) for full content.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      query: z.string().describe(
+        "The search query to run against Open Brain thoughts",
+      ),
+    },
+  },
+  async ({ query }) => {
+    try {
+      const qEmb = await getEmbedding(query);
+      const embStr = `[${qEmb.join(",")}]`;
+      const client = await pool.connect();
+      try {
+        const result = await client.queryObject<{
+          id: string;
+          content: string;
+          created_at: string;
+        }>(
+          `SELECT t.id::text AS id, t.content,
+                  to_char(t.created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+             FROM thoughts t
+            WHERE t.embedding IS NOT NULL
+              AND 1 - (t.embedding <=> $1::vector) > 0.5
+            ORDER BY t.embedding <=> $1::vector
+            LIMIT 10`,
+          [embStr],
+        );
+        const results = result.rows.map((t) => ({
+          id: t.id,
+          title: thoughtTitle(t.content, t.created_at),
+          url: thoughtUrl(t.id),
+        }));
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ results }) },
+          ],
+        };
+      } finally {
+        client.release();
+      }
+    } catch (err: unknown) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Error: ${(err as Error).message}`,
+        }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.registerTool(
+  "fetch",
+  {
+    title: "Fetch Open Brain Thought",
+    description:
+      "Fetch one Open Brain thought by ID after using search. Returns the full content and metadata for citation. ChatGPT-compatibility tool.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      id: z.string().describe(
+        "The Open Brain thought ID returned by the search tool",
+      ),
+    },
+  },
+  async ({ id }) => {
+    try {
+      const client = await pool.connect();
+      try {
+        const result = await client.queryObject<{
+          id: string;
+          content: string;
+          metadata: Record<string, unknown>;
+          created_at: string;
+          updated_at: string | null;
+        }>(
+          `SELECT id::text AS id, content, metadata,
+                  to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+                  to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
+             FROM thoughts WHERE id = $1::uuid`,
+          [id],
+        );
+        if (result.rows.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Error: thought ${id} not found.`,
+            }],
+            isError: true,
+          };
+        }
+        const t = result.rows[0];
+        const document = {
+          id: t.id,
+          title: thoughtTitle(t.content, t.created_at),
+          text: t.content,
+          url: thoughtUrl(t.id),
+          metadata: {
+            ...t.metadata,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+          },
+        };
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(document) }],
+        };
+      } finally {
+        client.release();
+      }
+    } catch (err: unknown) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Error: ${(err as Error).message}`,
+        }],
+        isError: true,
+      };
+    }
+  },
+);
+
 server.registerTool(
   "search_thoughts",
   {
     title: "Search Thoughts",
     description:
       "Search captured thoughts by meaning. Use this when the user asks about a topic, person, or idea they've previously captured.",
+    annotations: { readOnlyHint: true },
     inputSchema: {
       query: z.string().describe("What to search for"),
       limit: z.number().optional().default(10),
@@ -555,6 +713,7 @@ server.registerTool(
     title: "List Recent Thoughts",
     description:
       "List recently captured thoughts with optional filters by type, topic, person, or time range.",
+    annotations: { readOnlyHint: true },
     inputSchema: {
       limit: z.number().optional().default(10),
       type: z.string().optional().describe(
@@ -770,6 +929,195 @@ server.registerTool(
         }],
         isError: true,
       };
+    }
+  },
+);
+
+// --- update_thought tool — structured edit with attribution_log ---
+//
+// MCP clients can edit content, type, importance, or merge metadata on an
+// existing thought. Every transition is recorded in attribution_log
+// (migration 009) — provides a real audit trail instead of the
+// `updated_at` proxy. Mutating content re-fingerprints and re-embeds.
+
+server.registerTool(
+  "update_thought",
+  {
+    title: "Update Thought",
+    description:
+      "Update an existing thought by id. Any provided field overwrites; omitted fields are left unchanged. Mutating content re-fingerprints and re-embeds. Every change is recorded in attribution_log for audit.",
+    inputSchema: {
+      id: z.string().describe("UUID of the thought to update."),
+      content: z.string().optional().describe(
+        "New content text. If provided, also re-fingerprints and re-embeds.",
+      ),
+      type: z.string().optional().describe(
+        "New type, e.g. observation/task/idea/reference/decision/lesson.",
+      ),
+      importance: z.number().int().optional().describe(
+        "New importance value (1-5).",
+      ),
+      metadata: z.record(z.unknown()).optional().describe(
+        "Metadata fields to MERGE (existing keys preserved unless overridden). Pass {} to merge nothing.",
+      ),
+      actor: z.string().optional().describe(
+        "Who/what is making the edit. Recorded in attribution_log. Examples: 'claude', 'chatgpt', 'cli'.",
+      ),
+    },
+  },
+  async ({ id, content, type, importance, metadata, actor }) => {
+    if (
+      content === undefined && type === undefined &&
+      importance === undefined && metadata === undefined
+    ) {
+      return {
+        content: [{
+          type: "text" as const,
+          text:
+            "Error: at least one of content/type/importance/metadata required.",
+        }],
+        isError: true,
+      };
+    }
+    const client = await pool.connect();
+    try {
+      await client.queryArray("BEGIN");
+
+      const existing = await client.queryObject<{
+        content: string;
+        type: string | null;
+        importance: number | null;
+        metadata: Record<string, unknown>;
+      }>(
+        `SELECT content, type, importance, metadata
+           FROM thoughts WHERE id = $1::uuid FOR UPDATE`,
+        [id],
+      );
+      if (existing.rows.length === 0) {
+        await client.queryArray("ROLLBACK");
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Error: thought ${id} not found.`,
+          }],
+          isError: true,
+        };
+      }
+      const prev = existing.rows[0];
+
+      const actorTag = `mcp:${actor || "unknown"}`;
+      const changes: Array<{ action: string; old: unknown; new: unknown }> = [];
+
+      // content (re-fingerprint + re-embed if changed). Fingerprint formula
+      // matches the one in db/migrations/003_dedup.sql upsert_thought so the
+      // partial UNIQUE index stays consistent.
+      if (content !== undefined && content !== prev.content) {
+        const newEmb = await getEmbedding(content);
+        const embStr = `[${newEmb.join(",")}]`;
+        await client.queryArray(
+          `UPDATE thoughts
+              SET content = $1,
+                  content_fingerprint = encode(
+                    sha256(convert_to(
+                      lower(trim(regexp_replace($1, '\\s+', ' ', 'g'))),
+                      'UTF8'
+                    )),
+                    'hex'
+                  ),
+                  embedding = $2::vector
+            WHERE id = $3::uuid`,
+          [content, embStr, id],
+        );
+        changes.push({
+          action: "content_updated",
+          old: prev.content.slice(0, 200),
+          new: content.slice(0, 200),
+        });
+      }
+
+      if (type !== undefined && type !== prev.type) {
+        await client.queryArray(
+          `UPDATE thoughts SET type = $1 WHERE id = $2::uuid`,
+          [type, id],
+        );
+        changes.push({
+          action: "type_changed",
+          old: prev.type,
+          new: type,
+        });
+      }
+
+      if (importance !== undefined && importance !== prev.importance) {
+        await client.queryArray(
+          `UPDATE thoughts SET importance = $1 WHERE id = $2::uuid`,
+          [importance, id],
+        );
+        changes.push({
+          action: "importance_changed",
+          old: prev.importance,
+          new: importance,
+        });
+      }
+
+      if (metadata !== undefined && Object.keys(metadata).length > 0) {
+        await client.queryArray(
+          `UPDATE thoughts SET metadata = metadata || $1::jsonb WHERE id = $2::uuid`,
+          [JSON.stringify(metadata), id],
+        );
+        changes.push({
+          action: "metadata_merged",
+          old: prev.metadata,
+          new: metadata,
+        });
+      }
+
+      // Always bump updated_at (the BEFORE UPDATE trigger handles it for
+      // any UPDATE that ran; this guards the no-op case where nothing
+      // changed).
+      if (changes.length === 0) {
+        await client.queryArray("ROLLBACK");
+        return {
+          content: [{
+            type: "text" as const,
+            text: `No changes: all provided values already matched.`,
+          }],
+        };
+      }
+
+      for (const c of changes) {
+        await client.queryArray(
+          `INSERT INTO attribution_log
+             (thought_id, action, old_value, new_value, actor)
+           VALUES ($1::uuid, $2, $3::jsonb, $4::jsonb, $5)`,
+          [
+            id,
+            c.action,
+            JSON.stringify(c.old),
+            JSON.stringify(c.new),
+            actorTag,
+          ],
+        );
+      }
+
+      await client.queryArray("COMMIT");
+      const summary = changes.map((c) => c.action).join(", ");
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Updated thought ${id.slice(0, 8)}: ${summary}.`,
+        }],
+      };
+    } catch (err: unknown) {
+      await client.queryArray("ROLLBACK").catch(() => {});
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Error: ${(err as Error).message}`,
+        }],
+        isError: true,
+      };
+    } finally {
+      client.release();
     }
   },
 );

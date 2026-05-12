@@ -196,12 +196,41 @@ smoke: ci-env ## End-to-end smoke test using LLM_MOCK (no LLM credentials, isola
 	bin/obctl --url=$(SMOKE_HOST) --key=$$KEY list --limit 1; \
 	echo; \
 	echo "→ obctl stats"; \
-	bin/obctl --url=$(SMOKE_HOST) --key=$$KEY stats
+	bin/obctl --url=$(SMOKE_HOST) --key=$$KEY stats; \
+	echo; \
+	echo "→ ChatGPT-compat search tool"; \
+	RAW=$$(curl -fsS -X POST $(SMOKE_HOST)/mcp \
+	  -H "x-brain-key: $$KEY" \
+	  -H "Accept: application/json, text/event-stream" \
+	  -H "Content-Type: application/json" \
+	  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"search\",\"arguments\":{\"query\":\"$$SENTENCE\"}}}"); \
+	echo "$$RAW" | grep -qE 'results.*id.*title.*url' || { echo "FAIL: search tool did not return id/title/url shape"; echo "$$RAW"; exit 1; }; \
+	ID=$$(echo "$$RAW" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1); \
+	echo "  search returned id=$$ID"; \
+	echo "→ ChatGPT-compat fetch tool"; \
+	FETCH=$$(curl -fsS -X POST $(SMOKE_HOST)/mcp \
+	  -H "x-brain-key: $$KEY" \
+	  -H "Accept: application/json, text/event-stream" \
+	  -H "Content-Type: application/json" \
+	  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch\",\"arguments\":{\"id\":\"$$ID\"}}}"); \
+	echo "$$FETCH" | grep -qE 'sentinel' || { echo "FAIL: fetch did not return content"; echo "$$FETCH"; exit 1; }; \
+	echo "  fetch returned full document"; \
+	echo "→ update_thought tool + attribution_log"; \
+	UPDATE=$$(curl -fsS -X POST $(SMOKE_HOST)/mcp \
+	  -H "x-brain-key: $$KEY" \
+	  -H "Accept: application/json, text/event-stream" \
+	  -H "Content-Type: application/json" \
+	  -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"update_thought\",\"arguments\":{\"id\":\"$$ID\",\"importance\":5,\"actor\":\"smoke-test\"}}}"); \
+	echo "$$UPDATE" | grep -qE 'importance_changed|Updated thought' || { echo "FAIL: update_thought response missing success marker"; echo "$$UPDATE"; exit 1; }; \
+	echo "  update_thought returned: $$(echo "$$UPDATE" | grep -oE 'Updated thought[^\"]*')"; \
+	LOG_COUNT=$$(docker exec ob1-smoke-db-1 psql -U openbrain -d openbrain -tA -c "SELECT count(*) FROM attribution_log WHERE actor='mcp:smoke-test'" 2>/dev/null); \
+	echo "  attribution_log rows for smoke-test actor: $$LOG_COUNT (expect 1)"; \
+	[ "$$LOG_COUNT" -ge 1 ] || { echo "FAIL: attribution_log row not written"; exit 1; }
 	@echo
 	@echo "→ tearing down smoke stack"
 	@$(COMPOSE_SMOKE) down -v >/dev/null 2>&1 || true
 	@echo
-	@echo "OK — smoke test passed (capture, embedding insert, search RPC, list, stats)."
+	@echo "OK — smoke test passed (capture, search, list, stats, ChatGPT search/fetch, update_thought + attribution_log)."
 
 classify-edges: ## Run the typed-edge classifier batch (requires WORKER=1 stack up). Optional: LIMIT=N MIN_CONF=0.75
 	@$(COMPOSE) exec worker deno run --allow-net --allow-env --allow-read /app/classify.ts \
