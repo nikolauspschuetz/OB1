@@ -30,4 +30,29 @@ export const env = {
   get SESSION_MAX_AGE_S() {
     return parseInt(opt("DASHBOARD_SESSION_MAX_AGE", "604800"), 10);
   },
+  // Own profile name, e.g. "personal", "tech-screen". Empty for the
+  // default profile.
+  get OB1_PROFILE() {
+    return opt("OB1_PROFILE", "default");
+  },
+  // Comma-separated `name=url` pairs for sibling profiles, e.g.
+  // "personal=http://localhost:3013,tech-screen=http://localhost:3011".
+  // Computed by `make up` so users don't maintain it by hand.
+  get OB1_PEER_PROFILES(): Array<{ name: string; url: string }> {
+    const raw = opt("OB1_PEER_PROFILES", "");
+    if (!raw) return [];
+    return raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((pair) => {
+        const eq = pair.indexOf("=");
+        if (eq < 0) return null;
+        const name = pair.slice(0, eq).trim();
+        const url = pair.slice(eq + 1).trim();
+        if (!name || !url) return null;
+        return { name, url };
+      })
+      .filter((x): x is { name: string; url: string } => x !== null);
+  },
 };

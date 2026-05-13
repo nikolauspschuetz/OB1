@@ -188,6 +188,11 @@ services:
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD must be set in .env to enable the dashboard profile}
       DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:-${MCP_ACCESS_KEY}}
       DASHBOARD_SESSION_MAX_AGE: ${DASHBOARD_SESSION_MAX_AGE:-604800}
+      # Own profile name + peer list (computed by the Makefile). The
+      # peer list is consumed by the nav to render a Slack-style
+      # profile switcher. Empty when only one profile is configured.
+      OB1_PROFILE: ${OB1_PROFILE:-default}
+      OB1_PEER_PROFILES: ${OB1_PEER_PROFILES:-}
     ports:
       - "${DASHBOARD_PORT:-3000}:3000"
     healthcheck:

@@ -48,6 +48,12 @@ COMPOSE_PROFILES += --profile dashboard
 endif
 
 COMPOSE   ?= docker compose -p $(PROJECT) --env-file $(ENV_FILE) $(COMPOSE_PROFILES)
+
+# Helper script that prints "name=url,name=url" for sibling profiles
+# (excluding the active one) whose env file declares a DASHBOARD_PORT.
+# Used by recipes to populate OB1_PEER_PROFILES so the dashboard nav
+# can render a Slack-style profile switcher.
+PEER_PROFILES_CMD = ./ci/peer-profiles.sh $(PROFILE_LABEL)
 DB_USER   ?= openbrain
 DB_NAME   ?= openbrain
 MCP_PORT  ?= 8000
@@ -121,7 +127,8 @@ rebuild: ## Build with --no-cache
 	$(COMPOSE) build --no-cache
 
 up: ## Start the stack in the background
-	$(COMPOSE) up -d
+	@PEERS=$$($(PEER_PROFILES_CMD)); \
+	OB1_PROFILE=$(PROFILE_LABEL) OB1_PEER_PROFILES="$$PEERS" $(COMPOSE) up -d
 
 down: ## Stop the stack (preserves data volume)
 	$(COMPOSE) down
@@ -547,6 +554,32 @@ profile-list: ## List known profiles (.env files) and their running status
 profile-down: ## Stop a specific profile: make profile-down NAME=foo
 	@test -n "$(NAME)" || { echo "Usage: make profile-down NAME=<name>"; exit 1; }
 	@$(MAKE) PROFILE=$(NAME) down
+
+profiles: profile-list ## Alias for `profile-list`
+
+up-all: ## Start every profile that has an env file. DASHBOARD=1 / WORKER=1 still apply.
+	@for f in $$(ls .env .env.* 2>/dev/null | sort -u); do \
+	  test -f "$$f" || continue; \
+	  case "$$f" in \
+	    .env)               name="" ;; \
+	    .env.example|.env.smoke|.env.smoke-*) continue ;; \
+	    *)                  name=$${f#.env.} ;; \
+	  esac; \
+	  echo "==> $$f"; \
+	  $(MAKE) PROFILE=$$name up || exit 1; \
+	done
+
+down-all: ## Stop every running ob1-* profile. Safe — only touches stacks with an env file.
+	@for f in $$(ls .env .env.* 2>/dev/null | sort -u); do \
+	  test -f "$$f" || continue; \
+	  case "$$f" in \
+	    .env)               name="" ;; \
+	    .env.example|.env.smoke|.env.smoke-*) continue ;; \
+	    *)                  name=$${f#.env.} ;; \
+	  esac; \
+	  echo "==> stopping $$f"; \
+	  $(MAKE) PROFILE=$$name down 2>/dev/null || true; \
+	done
 
 switch-embedding-dim: ## Switch the schema's embedding dim: make switch-embedding-dim N=1024 (DESTRUCTIVE — wipes data)
 	@test -n "$(N)" || { echo "Usage: make switch-embedding-dim N=<dim> (e.g. 768, 1024, 1536)"; exit 1; }
