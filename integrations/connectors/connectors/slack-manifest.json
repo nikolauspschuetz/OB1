@@ -1,0 +1,30 @@
+{
+  "display_information": {
+    "name": "Open Brain",
+    "description": "Ingests Slack channel history into the per-corp Open Brain for semantic search and entity extraction.",
+    "background_color": "#0b0e14"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "OpenBrain",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "channels:history",
+        "channels:read",
+        "groups:history",
+        "groups:read",
+        "users:read",
+        "users:read.email"
+      ]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
