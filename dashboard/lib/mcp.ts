@@ -123,3 +123,36 @@ export async function synthesize(
   }
   return (await resp.json()) as { answer: string; sources: string[] };
 }
+
+/**
+ * Multi-turn RAG chat. Server-side does embed → vector search → llmChat.
+ */
+export async function chatTurn(args: {
+  history: Array<{ role: "user" | "assistant"; content: string }>;
+  topK?: number;
+}): Promise<{
+  answer: string;
+  retrieved: Array<{ id: string; content: string; similarity: number }>;
+  model?: string;
+}> {
+  const resp = await fetch(`${env.OB1_MCP_URL}/dashboard-api/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-brain-key": env.OB1_MCP_KEY,
+    },
+    body: JSON.stringify({ history: args.history, topK: args.topK ?? 8 }),
+  });
+  if (!resp.ok) {
+    const errBody = await resp.text();
+    throw new McpError(
+      `chat failed: ${resp.status} ${errBody.slice(0, 200)}`,
+      resp.status,
+    );
+  }
+  return (await resp.json()) as {
+    answer: string;
+    retrieved: Array<{ id: string; content: string; similarity: number }>;
+    model?: string;
+  };
+}

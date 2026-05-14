@@ -14,6 +14,7 @@ export function Nav() {
         </Link>
         <span style={{ color: "var(--color-text-dim)" }}>·</span>
         <Link href="/" className="no-underline" style={{ color: "var(--color-text-dim)" }}>Recent</Link>
+        <Link href="/chat" className="no-underline" style={{ color: "var(--color-text-dim)" }}>Chat</Link>
         <Link href="/entities" className="no-underline" style={{ color: "var(--color-text-dim)" }}>Entities</Link>
         <Link href="/wiki" className="no-underline" style={{ color: "var(--color-text-dim)" }}>Wiki</Link>
         <Link href="/queue" className="no-underline" style={{ color: "var(--color-text-dim)" }}>Queue</Link>

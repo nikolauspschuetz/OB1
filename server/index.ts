@@ -1656,6 +1656,141 @@ app.post("/dashboard-api/synthesize", async (c) => {
   }
 });
 
+// POST /dashboard-api/chat — multi-turn RAG endpoint.
+//
+// Body: {
+//   history: [{ role: "user"|"assistant", content }],
+//   topK?: number,         // retrieve top-K thoughts as system context (default 8)
+// }
+// Returns: {
+//   answer: string,
+//   retrieved: [{ id, content, similarity }]
+// }
+//
+// Server-side flow: embed the LAST user turn → vector search top-K
+// thoughts → assemble system prompt with retrieved passages + chat
+// history → call the LLM wrapper. Conversation persistence is the
+// dashboard's responsibility (chats / chat_messages tables); this
+// endpoint is stateless.
+
+app.post("/dashboard-api/chat", async (c) => {
+  const authError = requireBrainKey(c);
+  if (authError) return authError;
+  let body: {
+    history?: Array<{ role: string; content: string }>;
+    topK?: number;
+  };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid json body" }, 400, corsHeaders);
+  }
+  const history = Array.isArray(body.history) ? body.history : [];
+  const topK = Math.min(Math.max(body.topK ?? 8, 1), 20);
+  const lastUser = [...history].reverse().find((m) => m.role === "user");
+  if (!lastUser || !lastUser.content?.trim()) {
+    return c.json(
+      { error: "history must end with a user turn" },
+      400,
+      corsHeaders,
+    );
+  }
+
+  // Retrieve.
+  let retrieved: Array<{ id: string; content: string; similarity: number }> =
+    [];
+  try {
+    const embedResult = await llmEmbed({
+      input: lastUser.content.slice(0, 8000),
+    });
+    const queryVec = embedResult.embeddings[0] ?? [];
+    if (queryVec.length === 0) throw new Error("empty embedding");
+    const client = await pool.connect();
+    try {
+      const vecLiteral = `[${queryVec.join(",")}]`;
+      const result = await client.queryObject<{
+        id: string;
+        content: string;
+        similarity: string | number;
+      }>(
+        `SELECT id::text, content,
+                1 - (embedding <=> $1::vector) AS similarity
+           FROM thoughts
+          WHERE embedding IS NOT NULL
+            AND 1 - (embedding <=> $1::vector) > 0.15
+          ORDER BY embedding <=> $1::vector
+          LIMIT $2`,
+        [vecLiteral, topK],
+      );
+      // Deno postgres returns NUMERIC as string; coerce so the JSON
+      // payload carries real numbers for the dashboard's UI.
+      retrieved = result.rows.map((r) => ({
+        id: r.id,
+        content: r.content,
+        similarity: typeof r.similarity === "string"
+          ? parseFloat(r.similarity)
+          : r.similarity,
+      }));
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    return c.json(
+      { error: `retrieval failed: ${(err as Error).message}` },
+      502,
+      corsHeaders,
+    );
+  }
+
+  // Assemble system context with retrieved passages.
+  const passageBlock = retrieved
+    .map((p, i) =>
+      `[${i + 1}] (id=${p.id.slice(0, 8)}) ${p.content.slice(0, 1200)}`
+    )
+    .join("\n\n");
+  const systemPrompt =
+    "You are the user's Open Brain assistant. Answer using primarily the supplied passages from their captured knowledge. " +
+    "Cite specific passages inline using `[#xxxxxxxx]` syntax where xxxxxxxx is the first 8 hex chars of the thought id shown in parentheses. " +
+    "If the passages don't contain the answer, say so directly rather than making things up. Be concise but thorough.\n\n" +
+    (passageBlock
+      ? `Retrieved passages:\n${passageBlock}`
+      : "(no relevant passages retrieved)");
+
+  // Trim chat history to fit context: keep system + the most recent N
+  // turns. The wrapper imposes its own per-provider limits.
+  const trimmedHistory = history.slice(-12).map((m) => ({
+    role: m.role === "assistant" ? ("assistant" as const) : ("user" as const),
+    content: m.content,
+  }));
+
+  try {
+    const result = await llmChat({
+      system: systemPrompt,
+      messages: trimmedHistory,
+      maxTokens: 1024,
+    });
+    return c.json(
+      {
+        answer: result.text,
+        retrieved: retrieved.map((r) => ({
+          id: r.id,
+          content: r.content,
+          similarity: r.similarity,
+        })),
+        model: result.model,
+      },
+      200,
+      corsHeaders,
+    );
+  } catch (err) {
+    return c.json(
+      { error: (err as Error).message },
+      502,
+      corsHeaders,
+    );
+  }
+});
+
 // --- Metadata-only updates (no re-embedding) ---
 //
 // POST /thoughts/:id/metadata
