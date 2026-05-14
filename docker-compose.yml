@@ -162,6 +162,53 @@ services:
       retries: 10
       start_period: 5s
 
+  # External-source connector sidecar — opt-in via `IMPORTERS=1 make up`.
+  # One process runs every configured Connector (Slack today, Gmail /
+  # GitHub-backfill / Linear / Notion / Figma / calendar stubbed for
+  # future). Each connector self-disables when its required env is
+  # empty, so the same image works across profiles with different
+  # source mixes. POSTs every capture to the MCP server's
+  # capture_thought tool so embeddings + entity extraction happen
+  # automatically. See integrations/connectors/README.md.
+  importers:
+    build:
+      context: ./integrations/connectors
+      dockerfile: Dockerfile
+    profiles: ["importers"]
+    restart: unless-stopped
+    depends_on:
+      mcp:
+        condition: service_healthy
+    environment:
+      OB1_URL: http://mcp:8000
+      OB1_KEY: ${MCP_ACCESS_KEY:?MCP_ACCESS_KEY must be set in .env}
+      OB1_PROFILE: ${OB1_PROFILE:-default}
+      # Slack
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_ALLOWED_CHANNELS: ${SLACK_ALLOWED_CHANNELS:-}
+      SLACK_BACKFILL_DAYS: ${SLACK_BACKFILL_DAYS:-7}
+      SLACK_POLL_SECONDS: ${SLACK_POLL_SECONDS:-300}
+      # Gmail (stub)
+      GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-}
+      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
+      GMAIL_REFRESH_TOKEN: ${GMAIL_REFRESH_TOKEN:-}
+      GMAIL_QUERY: ${GMAIL_QUERY:-}
+      # GitHub backfill (stub)
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_ORG: ${GITHUB_ORG:-}
+      GITHUB_REPO_ALLOWLIST: ${GITHUB_REPO_ALLOWLIST:-}
+      # Linear (stub)
+      LINEAR_API_KEY: ${LINEAR_API_KEY:-}
+      LINEAR_TEAM_ALLOWLIST: ${LINEAR_TEAM_ALLOWLIST:-}
+      # Calendar / Figma / Notion (stubs)
+      CALENDAR_ICS_URL: ${CALENDAR_ICS_URL:-}
+      FIGMA_TOKEN: ${FIGMA_TOKEN:-}
+      FIGMA_FILE_ALLOWLIST: ${FIGMA_FILE_ALLOWLIST:-}
+      NOTION_TOKEN: ${NOTION_TOKEN:-}
+      NOTION_DATABASE_ALLOWLIST: ${NOTION_DATABASE_ALLOWLIST:-}
+    volumes:
+      - ob1-importer-state:/var/state
+
   # Next.js dashboard — opt-in via `DASHBOARD=1 make up`. Read path
   # talks directly to Postgres; write path POSTs to the MCP server's
   # tool surface so we never duplicate business logic.
@@ -209,3 +256,4 @@ services:
 
 volumes:
   ob1-db-data: {}
+  ob1-importer-state: {}
