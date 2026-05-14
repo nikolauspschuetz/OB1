@@ -41,6 +41,7 @@ BACKEND ?=
 WORKER ?=
 DASHBOARD ?=
 GATEWAY ?=
+IMPORTERS ?=
 COMPOSE_PROFILES :=
 ifeq ($(BACKEND),bedrock)
 COMPOSE_PROFILES += --profile bedrock
@@ -50,6 +51,9 @@ COMPOSE_PROFILES += --profile worker
 endif
 ifneq ($(DASHBOARD),)
 COMPOSE_PROFILES += --profile dashboard
+endif
+ifneq ($(IMPORTERS),)
+COMPOSE_PROFILES += --profile importers
 endif
 COMPOSE_FILES := -f docker-compose.yml
 ifneq ($(GATEWAY),)
@@ -605,6 +609,13 @@ gateway-down: ## Stop Traefik and remove the shared network
 	@docker compose -p ob1-gateway -f gateway/docker-compose.yml down 2>/dev/null || true
 	@docker network rm ob1_gateway 2>/dev/null || true
 	@echo "Gateway stopped. Profile stacks themselves are untouched."
+
+claude-link: ## Wire a repo's Claude Code to a profile's brain: make claude-link PROFILE=tech-screen TARGET=~/github.com/tech-screen/SaaS-Tech-Screen
+	@test -n "$(TARGET)" || { echo "Usage: make claude-link PROFILE=<profile> TARGET=<path>"; exit 1; }
+	@./ci/claude-link.sh $(PROFILE_LABEL) $(TARGET)
+
+claude-link-self: ## Link THIS repo's Claude Code to the active profile (so dogfood sessions are brain-aware)
+	@./ci/claude-link.sh $(PROFILE_LABEL) $(CURDIR)
 
 gateway-status: ## Show Traefik state + discovered routes
 	@if ! docker ps --format '{{.Names}}' | grep -q '^ob1-gateway$$'; then \
