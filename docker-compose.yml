@@ -209,6 +209,35 @@ services:
     volumes:
       - ob1-importer-state:/var/state
 
+  # Socket Mode Slack bot — opt-in via `SLACKBOT=1 make up`. Opens a
+  # WebSocket outbound to Slack (no public URL required) and acts as a
+  # conversational front-end to the brain: DMs and @mentions parse into
+  # capture / query commands and reply with citations. See
+  # integrations/slack_bot/README.md.
+  slack-bot:
+    build:
+      context: ./integrations/slack_bot
+      dockerfile: Dockerfile
+    profiles: ["slackbot"]
+    restart: unless-stopped
+    depends_on:
+      mcp:
+        condition: service_healthy
+    environment:
+      OB1_URL: http://mcp:8000
+      OB1_KEY: ${MCP_ACCESS_KEY:?MCP_ACCESS_KEY must be set in .env}
+      OB1_PROFILE: ${OB1_PROFILE:-default}
+      # Validation deferred to the bot's main() so `compose build` works
+      # even before the token exists. The bot will fail-fast on startup
+      # if either is missing or empty.
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      # Used by the bot to render [#xxxxxxxx] citations as clickable
+      # Slack links pointing at the dashboard. Optional — bot still
+      # works without it, just won't link out.
+      DASHBOARD_PUBLIC_URL: ${DASHBOARD_PUBLIC_URL:-}
+      LOG_LEVEL: ${SLACKBOT_LOG_LEVEL:-INFO}
+
   # Next.js dashboard — opt-in via `DASHBOARD=1 make up`. Read path
   # talks directly to Postgres; write path POSTs to the MCP server's
   # tool surface so we never duplicate business logic.

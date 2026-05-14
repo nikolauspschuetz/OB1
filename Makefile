@@ -42,6 +42,7 @@ WORKER ?=
 DASHBOARD ?=
 GATEWAY ?=
 IMPORTERS ?=
+SLACKBOT ?=
 COMPOSE_PROFILES :=
 ifeq ($(BACKEND),bedrock)
 COMPOSE_PROFILES += --profile bedrock
@@ -54,6 +55,9 @@ COMPOSE_PROFILES += --profile dashboard
 endif
 ifneq ($(IMPORTERS),)
 COMPOSE_PROFILES += --profile importers
+endif
+ifneq ($(SLACKBOT),)
+COMPOSE_PROFILES += --profile slackbot
 endif
 COMPOSE_FILES := -f docker-compose.yml
 ifneq ($(GATEWAY),)

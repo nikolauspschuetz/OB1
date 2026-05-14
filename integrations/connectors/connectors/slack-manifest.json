@@ -1,30 +1,51 @@
 {
   "display_information": {
     "name": "Open Brain",
-    "description": "Ingests Slack channel history into the per-corp Open Brain for semantic search and entity extraction.",
+    "description": "Your second brain on Slack. Remembers conversations, surfaces context, and answers questions grounded in your team's history.",
+    "long_description": "Open Brain is your team's institutional memory — a local-first, profile-aware AI brain that listens to your Slack channels, indexes every conversation with semantic search, and answers questions with citations back to the exact messages it learned from.\n\nIt's a read layer over your knowledge. Invite it to a channel and Open Brain quietly captures history into your private Open Brain instance (running on your laptop or a private host — not in someone else's cloud). Then later, DM it or @mention it:\n\n• \"What did Brian decide about the migration last sprint?\"\n• \"Remind me what we landed on for VPN rotation?\"\n• \"Who has context on the WebRTC pipeline?\"\n\nOpen Brain replies with answers grounded in actual Slack messages, with clickable citations back to the source.\n\n**Local-first by design.** Your conversations live in your own Postgres instance. No SaaS dependency. Choose your own LLM provider — OpenAI, Anthropic, GitHub Models, AWS Bedrock, or local Ollama.\n\n**Per-workspace isolation.** Each Slack workspace maps to its own brain. tech-screen Slack stays separate from linguado Slack — no comingling.\n\n**Open source:** github.com/NateBJones-Projects/OB1",
     "background_color": "#0b0e14"
   },
   "features": {
     "bot_user": {
       "display_name": "OpenBrain",
-      "always_online": false
+      "always_online": true
+    },
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
     }
   },
   "oauth_config": {
     "scopes": {
       "bot": [
+        "app_mentions:read",
         "channels:history",
+        "channels:join",
         "channels:read",
+        "chat:write",
         "groups:history",
         "groups:read",
+        "im:history",
+        "im:read",
+        "im:write",
         "users:read",
         "users:read.email"
       ]
     }
   },
   "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention",
+        "message.im"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": false
+    },
     "org_deploy_enabled": false,
-    "socket_mode_enabled": false,
+    "socket_mode_enabled": true,
     "token_rotation_enabled": false
   }
 }
