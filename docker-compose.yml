@@ -193,6 +193,11 @@ services:
       # profile switcher. Empty when only one profile is configured.
       OB1_PROFILE: ${OB1_PROFILE:-default}
       OB1_PEER_PROFILES: ${OB1_PEER_PROFILES:-}
+      # When set, the dashboard signs cookies scoped to this domain so
+      # the session is shared across subdomains (e.g. .ob1.localhost).
+      # Empty = host-only cookie (per-port shape, today's default).
+      # Populated by docker-compose.gateway.yml when GATEWAY=1.
+      OB1_COOKIE_DOMAIN: ${OB1_COOKIE_DOMAIN:-}
     ports:
       - "${DASHBOARD_PORT:-3000}:3000"
     healthcheck:

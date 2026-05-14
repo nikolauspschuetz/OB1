@@ -1,0 +1,39 @@
+# Single-entrypoint gateway for OB1 dashboards.
+# Brings up Traefik on $GATEWAY_PORT (default 3000). Each profile's
+# dashboard joins the `ob1_gateway` external network and advertises
+# its subdomain via Docker labels.
+#
+# Bring up: make gateway-up
+# Then per-profile: GATEWAY=1 DASHBOARD=1 make up PROFILE=tech-screen
+#
+# After both, visit http://<profile>.ob1.localhost:<GATEWAY_PORT>/
+# Chrome and Firefox resolve *.localhost → 127.0.0.1 automatically;
+# Safari since macOS 12 does too. If your resolver doesn't, add
+# entries to /etc/hosts (see README).
+
+services:
+  gateway:
+    image: traefik:v3.5
+    container_name: ob1-gateway
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=ob1_gateway
+      - --entrypoints.web.address=:80
+      - --api.dashboard=true
+      - --api.insecure=true
+      - --log.level=INFO
+      - --accesslog=false
+    ports:
+      - "${GATEWAY_PORT:-3000}:80"
+      - "${GATEWAY_TRAEFIK_PORT:-8088}:8080"  # Traefik dashboard for debugging
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - ob1_gateway
+
+networks:
+  ob1_gateway:
+    external: true
+    name: ob1_gateway

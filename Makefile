@@ -33,9 +33,14 @@ endif
 #   BACKEND=bedrock  → enables the litellm gateway
 #   WORKER=1         → enables the entity-extraction worker (server/worker.ts)
 #   DASHBOARD=1      → enables the Next.js dashboard (dashboard/)
+#   GATEWAY=1        → layers docker-compose.gateway.yml so the dashboard
+#                      joins the shared Traefik network ob1_gateway and
+#                      advertises its subdomain route. Requires
+#                      `make gateway-up` first (one-time per host).
 BACKEND ?=
 WORKER ?=
 DASHBOARD ?=
+GATEWAY ?=
 COMPOSE_PROFILES :=
 ifeq ($(BACKEND),bedrock)
 COMPOSE_PROFILES += --profile bedrock
@@ -46,8 +51,17 @@ endif
 ifneq ($(DASHBOARD),)
 COMPOSE_PROFILES += --profile dashboard
 endif
+COMPOSE_FILES := -f docker-compose.yml
+ifneq ($(GATEWAY),)
+COMPOSE_FILES += -f docker-compose.gateway.yml
+endif
 
-COMPOSE   ?= docker compose -p $(PROJECT) --env-file $(ENV_FILE) $(COMPOSE_PROFILES)
+# Base domain Traefik routes against. Each profile becomes
+# <profile>.<OB1_BASE_DOMAIN>. *.localhost auto-resolves to 127.0.0.1
+# in Chrome/Firefox/Safari; override for real DNS (e.g. ob1.test).
+OB1_BASE_DOMAIN ?= ob1.localhost
+
+COMPOSE   ?= docker compose -p $(PROJECT) --env-file $(ENV_FILE) $(COMPOSE_FILES) $(COMPOSE_PROFILES)
 
 # Helper script that prints "name=url,name=url" for sibling profiles
 # (excluding the active one) whose env file declares a DASHBOARD_PORT.
@@ -69,7 +83,7 @@ SMOKE_HOST    := http://localhost:18000
 COMPOSE_SMOKE_BEDROCK := docker compose -p ob1-smoke-bedrock --env-file .env.smoke-bedrock --profile ci-bedrock
 SMOKE_BEDROCK_HOST    := http://localhost:18010
 
-.PHONY: help env doctor up down restart build rebuild logs ps psql verify urls rotate-key setup clean nuke smoke smoke-webhook smoke-bedrock metrics obctl-install ci ci-env ci-env-bedrock fmt-check lint check-env-drift quality profile-init profile-list profile-down install-hooks uninstall-hooks switch-embedding-dim verify-bedrock bedrock-list-models backfill-embeddings import-gh-token
+.PHONY: help env doctor up down restart build rebuild logs ps psql verify urls rotate-key setup clean nuke smoke smoke-webhook smoke-bedrock metrics obctl-install ci ci-env ci-env-bedrock fmt-check lint check-env-drift quality profile-init profile-list profile-down profiles up-all down-all gateway-up gateway-down gateway-status install-hooks uninstall-hooks switch-embedding-dim verify-bedrock bedrock-list-models backfill-embeddings import-gh-token
 
 help: ## Show this help
 	@printf "Open Brain — local Docker Compose\n\n"
@@ -127,8 +141,14 @@ rebuild: ## Build with --no-cache
 	$(COMPOSE) build --no-cache
 
 up: ## Start the stack in the background
-	@PEERS=$$($(PEER_PROFILES_CMD)); \
-	OB1_PROFILE=$(PROFILE_LABEL) OB1_PEER_PROFILES="$$PEERS" $(COMPOSE) up -d
+	@PEERS=$$($(PEER_PROFILES_CMD) $(OB1_BASE_DOMAIN) $(GATEWAY)); \
+	COOKIE_DOMAIN=""; \
+	if [ -n "$(GATEWAY)" ]; then COOKIE_DOMAIN=".$(OB1_BASE_DOMAIN)"; fi; \
+	OB1_PROFILE=$(PROFILE_LABEL) \
+	OB1_PEER_PROFILES="$$PEERS" \
+	OB1_BASE_DOMAIN=$(OB1_BASE_DOMAIN) \
+	OB1_COOKIE_DOMAIN="$$COOKIE_DOMAIN" \
+	$(COMPOSE) up -d
 
 down: ## Stop the stack (preserves data volume)
 	$(COMPOSE) down
@@ -165,7 +185,12 @@ urls: ## Print the MCP server URL and connection URL for AI clients
 	@if [ -n "$(DASHBOARD)" ]; then \
 	  DPORT=$$(grep -E '^DASHBOARD_PORT=' $(ENV_FILE) | cut -d= -f2-); \
 	  DPORT=$${DPORT:-3000}; \
-	  echo "Dashboard URL:      http://localhost:$$DPORT"; \
+	  if [ -n "$(GATEWAY)" ]; then \
+	    echo "Dashboard URL:      http://$(PROFILE_LABEL).$(OB1_BASE_DOMAIN):$(GATEWAY_PORT) (via gateway)"; \
+	    echo "                    http://localhost:$$DPORT (direct, bypasses gateway)"; \
+	  else \
+	    echo "Dashboard URL:      http://localhost:$$DPORT"; \
+	  fi; \
 	fi
 
 rotate-key: ## Generate a new MCP_ACCESS_KEY in the active profile's env file and restart the server
@@ -556,6 +581,42 @@ profile-down: ## Stop a specific profile: make profile-down NAME=foo
 	@$(MAKE) PROFILE=$(NAME) down
 
 profiles: profile-list ## Alias for `profile-list`
+
+GATEWAY_PORT ?= 3010
+GATEWAY_TRAEFIK_PORT ?= 8088
+
+gateway-up: ## Start the single-entrypoint Traefik gateway on $GATEWAY_PORT (default 3000)
+	@echo "→ creating shared docker network ob1_gateway (idempotent)"
+	@docker network inspect ob1_gateway >/dev/null 2>&1 || docker network create ob1_gateway >/dev/null
+	@echo "→ starting Traefik"
+	@GATEWAY_PORT=$(GATEWAY_PORT) GATEWAY_TRAEFIK_PORT=$(GATEWAY_TRAEFIK_PORT) \
+	  docker compose -p ob1-gateway -f gateway/docker-compose.yml up -d
+	@echo
+	@echo "Gateway is up on http://localhost:$(GATEWAY_PORT)"
+	@echo "Traefik dashboard: http://localhost:$(GATEWAY_TRAEFIK_PORT)/"
+	@echo
+	@echo "Now bring up profiles with GATEWAY=1 so they advertise routes:"
+	@echo "  GATEWAY=1 DASHBOARD=1 WORKER=1 make up PROFILE=personal"
+	@echo "  GATEWAY=1 DASHBOARD=1 WORKER=1 make up PROFILE=tech-screen"
+	@echo
+	@echo "Then open http://<profile>.$(OB1_BASE_DOMAIN):$(GATEWAY_PORT)"
+
+gateway-down: ## Stop Traefik and remove the shared network
+	@docker compose -p ob1-gateway -f gateway/docker-compose.yml down 2>/dev/null || true
+	@docker network rm ob1_gateway 2>/dev/null || true
+	@echo "Gateway stopped. Profile stacks themselves are untouched."
+
+gateway-status: ## Show Traefik state + discovered routes
+	@if ! docker ps --format '{{.Names}}' | grep -q '^ob1-gateway$$'; then \
+	  echo "Gateway is NOT running. Start with: make gateway-up"; exit 0; \
+	fi
+	@echo "Gateway: running on http://localhost:$(GATEWAY_PORT)"
+	@echo "Traefik dashboard: http://localhost:$(GATEWAY_TRAEFIK_PORT)/"
+	@echo
+	@echo "Discovered routes:"
+	@curl -fsS "http://localhost:$(GATEWAY_TRAEFIK_PORT)/api/http/routers" 2>/dev/null \
+	  | python3 -c "import json,sys; rs=json.load(sys.stdin); [print(f'  {r[\"rule\"]:60s} → {r.get(\"service\",\"-\")}') for r in rs if r.get('provider')=='docker']" \
+	  || echo "  (no routes discovered — bring up a profile with GATEWAY=1)"
 
 up-all: ## Start every profile that has an env file. DASHBOARD=1 / WORKER=1 still apply.
 	@for f in $$(ls .env .env.* 2>/dev/null | sort -u); do \

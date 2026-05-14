@@ -1,0 +1,25 @@
+# Compose override layered on top of docker-compose.yml when GATEWAY=1.
+# Adds Traefik discovery labels + joins the shared ob1_gateway network
+# so the gateway stack (gateway/docker-compose.yml) can route requests
+# by Host header.
+#
+# Usage (via Makefile, opted in by GATEWAY=1):
+#   docker compose -f docker-compose.yml -f docker-compose.gateway.yml ...
+
+services:
+  dashboard:
+    networks:
+      - default
+      - ob1_gateway
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=ob1_gateway"
+      - "traefik.http.routers.ob1-${OB1_PROFILE:-default}.rule=Host(`${OB1_PROFILE:-default}.${OB1_BASE_DOMAIN:-ob1.localhost}`)"
+      - "traefik.http.routers.ob1-${OB1_PROFILE:-default}.entrypoints=web"
+      - "traefik.http.services.ob1-${OB1_PROFILE:-default}.loadbalancer.server.port=3000"
+
+networks:
+  default: {}
+  ob1_gateway:
+    external: true
+    name: ob1_gateway

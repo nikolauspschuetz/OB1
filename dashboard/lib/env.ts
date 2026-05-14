@@ -30,6 +30,12 @@ export const env = {
   get SESSION_MAX_AGE_S() {
     return parseInt(opt("DASHBOARD_SESSION_MAX_AGE", "604800"), 10);
   },
+  // When set (typically ".ob1.localhost" behind Traefik), the session
+  // cookie is scoped to this domain so login persists across subdomains
+  // (personal.ob1.localhost, tech-screen.ob1.localhost, …).
+  get COOKIE_DOMAIN() {
+    return opt("OB1_COOKIE_DOMAIN", "") || undefined;
+  },
   // Own profile name, e.g. "personal", "tech-screen". Empty for the
   // default profile.
   get OB1_PROFILE() {
