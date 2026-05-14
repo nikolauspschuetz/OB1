@@ -152,6 +152,11 @@ up: ## Start the stack in the background
 	@PEERS=$$($(PEER_PROFILES_CMD) $(OB1_BASE_DOMAIN) $(GATEWAY)); \
 	COOKIE_DOMAIN=""; \
 	if [ -n "$(GATEWAY)" ]; then COOKIE_DOMAIN=".$(OB1_BASE_DOMAIN)"; fi; \
+	AWS_EXPORT=""; \
+	if [ "$(BACKEND)" = "bedrock" ]; then \
+	  AWS_EXPORT=$$(./ci/export-aws-creds.sh $(ENV_FILE) 2>/dev/null || true); \
+	fi; \
+	env $$AWS_EXPORT \
 	OB1_PROFILE=$(PROFILE_LABEL) \
 	OB1_PEER_PROFILES="$$PEERS" \
 	OB1_BASE_DOMAIN=$(OB1_BASE_DOMAIN) \
