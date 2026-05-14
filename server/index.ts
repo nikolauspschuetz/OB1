@@ -900,13 +900,25 @@ server.registerTool(
       content: z.string().describe(
         "The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI",
       ),
+      metadata: z.record(z.string(), z.unknown()).optional().describe(
+        "Optional caller-supplied metadata to merge into the thought. Use `source` to identify the upstream system (e.g. `slack`, `gmail`, `github`); `mcp` is the default. Connectors should set source-attribution fields here (source_id, source_actor, source_url, source_channel, etc.).",
+      ),
+      extract_topics: z.boolean().optional().describe(
+        "When true (default), the server runs an LLM metadata-extraction pass on capture (type, topics, people, action_items). External-source connectors should set false — they already supply structured metadata, and the entity-extraction worker still runs asynchronously regardless. Setting false halves the per-capture LLM call volume.",
+      ),
     },
   },
-  async ({ content }) => {
+  async ({ content, metadata, extract_topics }) => {
     try {
+      const callerMeta = metadata ?? {};
+      // Default source = "mcp" unless the caller explicitly supplies one.
+      const source = typeof callerMeta.source === "string" && callerMeta.source
+        ? callerMeta.source
+        : "mcp";
       const { metadata: meta } = await captureThought(content, {
-        extractTopics: true,
-        source: "mcp",
+        extractTopics: extract_topics ?? true,
+        source,
+        metadata: callerMeta,
       });
       let confirmation = `Captured as ${meta.type || "thought"}`;
       if (Array.isArray(meta.topics) && meta.topics.length) {

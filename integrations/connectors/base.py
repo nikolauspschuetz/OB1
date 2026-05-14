@@ -166,17 +166,30 @@ class OB1Client:
         self.access_key = access_key
         self.log = logger
 
-    def capture(self, cap: Capture, request_id: int = 1) -> bool:
-        """POST capture_thought via /mcp. Returns True on success.
+    def capture(
+        self,
+        cap: Capture,
+        request_id: int = 1,
+        *,
+        extract_topics: bool = False,
+    ) -> tuple[bool, str | None]:
+        """POST capture_thought via /mcp. Returns (success, error_text).
 
         Content is truncated to 8000 chars to match the server's
         embedding-side cap. Metadata is passed through wholesale —
         the server allows arbitrary JSONB and the entity worker /
         dashboard read it back.
+
+        extract_topics=False (the connector-friendly default) tells
+        the server to skip the LLM metadata-extraction step. External
+        sources already supply structured metadata (channel, actor,
+        url) so the extraction is duplicate work AND a rate-limit
+        amplifier. The entity-extraction worker still runs async via
+        the entity_extraction_queue — entity/topic enrichment happens
+        either way.
         """
         if not self.access_key:
-            self.log.error("OB1_KEY not set; cannot capture")
-            return False
+            return False, "OB1_KEY not set"
         body = json.dumps({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -186,11 +199,12 @@ class OB1Client:
                 "arguments": {
                     "content": cap.content[:8000],
                     "metadata": cap.metadata,
+                    "extract_topics": extract_topics,
                 },
             },
         }).encode("utf-8")
         try:
-            status, _hdrs, resp_body = http_request(
+            _status, _hdrs, resp_body = http_request(
                 f"{self.base_url}/mcp",
                 method="POST",
                 headers={
@@ -201,14 +215,33 @@ class OB1Client:
                 body=body,
             )
         except HttpError as e:
-            self.log.error("capture failed: %s", e)
-            return False
+            return False, f"transport: {e}"
         # MCP streamable-http returns SSE-style "event: message\ndata: {...}".
         text = resp_body.decode("utf-8", errors="replace")
-        if '"result"' in text or "Captured" in text:
-            return True
-        self.log.warning("unexpected capture response: %s", text[:200])
-        return False
+        # Parse the data: line to inspect isError properly. A tool
+        # error returns 200 OK with result.isError=true; we must not
+        # treat that as success.
+        data_line = next(
+            (line[len("data: "):] for line in text.splitlines() if line.startswith("data: ")),
+            None,
+        )
+        if not data_line:
+            return False, f"no data line in response: {text[:200]}"
+        try:
+            payload = json.loads(data_line)
+        except Exception as e:
+            return False, f"parse failed: {e}; body={text[:200]}"
+        result = payload.get("result")
+        if not result:
+            err = payload.get("error", {})
+            return False, f"jsonrpc error: {err.get('message') or err}"
+        if result.get("isError"):
+            msg = ""
+            content = result.get("content") or []
+            if content and isinstance(content[0], dict):
+                msg = content[0].get("text", "")
+            return False, msg[:300]
+        return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -300,9 +333,27 @@ class Connector(abc.ABC):
             out.setdefault("context", profile)
         return out
 
+    def per_capture_delay_ms(self) -> int:
+        """Throttle between captures to respect upstream rate limits.
+        Override per source. Default 400ms ≈ 150 captures/min — well
+        under GitHub Models' embedding limit. Worth keeping for any
+        OpenAI-compatible provider."""
+        return int(self.env.get(f"{self.name.upper()}_CAPTURE_DELAY_MS",
+                                 self.env.get("CAPTURE_DELAY_MS", "400")))
+
+    def capture_max_per_run(self) -> int:
+        """Cap captures per run so a huge backfill doesn't block the
+        watch loop forever. Connector state advances after each
+        success so subsequent --watch ticks pick up where this left
+        off. Default 200 per run (≈1.5 min at 400ms delay)."""
+        return int(self.env.get(f"{self.name.upper()}_MAX_PER_RUN",
+                                 self.env.get("CAPTURE_MAX_PER_RUN", "200")))
+
     def run_once(self) -> RunResult:
         """Load state, fetch new captures, POST each, save state.
-        Idempotent — content_fingerprint dedups on the server side."""
+        Idempotent — content_fingerprint dedups on the server side.
+        Throttled — per_capture_delay_ms between captures, capped at
+        capture_max_per_run captures per call so 429s don't compound."""
         if not self._configured:
             ok = self.configure()
             self._configured = ok
@@ -312,8 +363,11 @@ class Connector(abc.ABC):
 
         t0 = time.time()
         state = self.state.load()
+        delay = self.per_capture_delay_ms() / 1000.0
+        max_per_run = self.capture_max_per_run()
         fetched = captured = skipped = errors = 0
         rid = 1
+        consecutive_errors = 0
         try:
             for cap in self.fetch_new(state):
                 fetched += 1
@@ -321,11 +375,35 @@ class Connector(abc.ABC):
                     skipped += 1
                     continue
                 cap.metadata = self.stamp_metadata(cap.metadata)
-                if self.ob1.capture(cap, request_id=rid):
+                ok, err = self.ob1.capture(cap, request_id=rid)
+                rid += 1
+                if ok:
                     captured += 1
+                    consecutive_errors = 0
                 else:
                     errors += 1
-                rid += 1
+                    consecutive_errors += 1
+                    if errors <= 3 or errors % 50 == 0:
+                        self.log.warning(
+                            "[%s] capture failed: %s", self.name, err,
+                        )
+                    # Likely rate-limit — back off harder to let the
+                    # upstream LLM provider recover. Next run picks
+                    # up the cursor.
+                    if consecutive_errors >= 5:
+                        self.log.warning(
+                            "[%s] %d consecutive errors; stopping this run",
+                            self.name, consecutive_errors,
+                        )
+                        break
+                if captured >= max_per_run:
+                    self.log.info(
+                        "[%s] hit capture_max_per_run=%d; will resume next tick",
+                        self.name, max_per_run,
+                    )
+                    break
+                if delay > 0:
+                    time.sleep(delay)
         except Exception as e:
             self.log.exception("%s fetch_new failed: %s", self.name, e)
             errors += 1

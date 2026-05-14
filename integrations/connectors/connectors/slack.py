@@ -192,14 +192,22 @@ class SlackConnector(Connector):
             ch_name = ch.get("name", ch_id)
             oldest = per_channel.get(ch_id, backfill_oldest)
             cursor: str | None = None
-            highest_ts: str = oldest
             count = 0
+
+            def advance(ts: str) -> None:
+                """Per-message cursor advance. Checkpoint state every
+                yield so a mid-batch break (rate limit, max_per_run)
+                doesn't lose progress."""
+                current = per_channel.get(ch_id, oldest)
+                if ts > current:
+                    per_channel[ch_id] = ts
+
             while True:
                 try:
                     data = self._api(
                         "conversations.history",
                         channel=ch_id,
-                        oldest=oldest,
+                        oldest=per_channel.get(ch_id, oldest),
                         limit=200,
                         cursor=cursor,
                     )
@@ -213,8 +221,9 @@ class SlackConnector(Connector):
                     if cap:
                         count += 1
                         yield cap
-                    if msg.get("ts", "") > highest_ts:
-                        highest_ts = msg["ts"]
+                    ts = msg.get("ts", "")
+                    if ts:
+                        advance(ts)
                     # Pull thread replies for messages that have them.
                     if msg.get("thread_ts") == msg.get("ts") and int(msg.get("reply_count", 0)) > 0:
                         try:
@@ -231,11 +240,10 @@ class SlackConnector(Connector):
                             if rep_cap:
                                 count += 1
                                 yield rep_cap
-                            if rep.get("ts", "") > highest_ts:
-                                highest_ts = rep["ts"]
+                            rts = rep.get("ts", "")
+                            if rts:
+                                advance(rts)
                 cursor = data.get("response_metadata", {}).get("next_cursor") or None
                 if not cursor or not messages:
                     break
-            if highest_ts > oldest:
-                per_channel[ch_id] = highest_ts
             self.log.info("  #%s: %d new", ch_name, count)
