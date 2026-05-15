@@ -91,7 +91,7 @@ SMOKE_HOST    := http://localhost:18000
 COMPOSE_SMOKE_BEDROCK := docker compose -p ob1-smoke-bedrock --env-file .env.smoke-bedrock --profile ci-bedrock
 SMOKE_BEDROCK_HOST    := http://localhost:18010
 
-.PHONY: help env doctor up down restart build rebuild logs ps psql verify urls rotate-key setup clean nuke smoke smoke-webhook smoke-bedrock metrics obctl-install ci ci-env ci-env-bedrock fmt-check lint check-env-drift quality profile-init profile-list profile-down profiles up-all down-all gateway-up gateway-down gateway-status install-hooks uninstall-hooks switch-embedding-dim verify-bedrock bedrock-list-models backfill-embeddings import-gh-token
+.PHONY: help env doctor up down restart build rebuild logs ps psql verify urls rotate-key setup clean nuke smoke smoke-webhook smoke-bedrock metrics obctl-install ci ci-env ci-env-bedrock fmt-check lint check-env-drift quality profile-init profile-list profile-down profiles up-all down-all gateway-up gateway-down gateway-status claude-link claude-link-self slack-join-all install-hooks uninstall-hooks switch-embedding-dim verify-bedrock bedrock-list-models backfill-embeddings import-gh-token
 
 help: ## Show this help
 	@printf "Open Brain — local Docker Compose\n\n"
@@ -625,6 +625,12 @@ claude-link: ## Wire a repo's Claude Code to a profile's brain: make claude-link
 
 claude-link-self: ## Link THIS repo's Claude Code to the active profile (so dogfood sessions are brain-aware)
 	@./ci/claude-link.sh $(PROFILE_LABEL) $(CURDIR)
+
+slack-join-all: ## Bulk-join the OB1 Slack bot to every public channel: make slack-join-all PROFILE=linguado [DRY_RUN=1] [EXCLUDE=general,random]
+	@python3 -m integrations.connectors.slack_join_all \
+	  --env-file $(ENV_FILE) \
+	  $(if $(DRY_RUN),--dry-run,) \
+	  $(if $(EXCLUDE),--exclude $(EXCLUDE),)
 
 gateway-status: ## Show Traefik state + discovered routes
 	@if ! docker ps --format '{{.Names}}' | grep -q '^ob1-gateway$$'; then \
